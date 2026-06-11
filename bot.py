@@ -99,7 +99,7 @@ def main_menu(uid=None):
         [InlineKeyboardButton("💰 Balance", callback_data="menu_balance"), InlineKeyboardButton("⚙ My Accounts", callback_data="menu_accounts")],
         [InlineKeyboardButton("📊 Analyse", callback_data="menu_analyse"), InlineKeyboardButton("📖 Journal", callback_data="menu_journal")],
         [InlineKeyboardButton("📈 My Pairs", callback_data="menu_pairs"), InlineKeyboardButton("📜 Trade History", callback_data="menu_hist")],
-        [InlineKeyboardButton("➕ Add Account", callback_data="menu_add"), InlineKeyboardButton("💸 Profit Tracker", callback_data="menu_profit")],
+        [InlineKeyboardButton("➕ Add Account", callback_data="menu_add"), InlineKeyboardButton("💰 Wallet & Tools ", callback_data="menu_profit")],
     ]
     if uid and is_admin(uid):
         rows.append([InlineKeyboardButton("👑 ADMIN PANEL", callback_data="menu_admin")])
