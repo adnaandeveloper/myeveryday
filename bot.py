@@ -93,7 +93,7 @@ def is_admin(tid):
     s.close()
     return u and u.is_admin == '1'
 
-def main_menu(uid=None): # FIXED: now takes uid to hide admin
+def main_menu(uid=None):
     rows = [
         [InlineKeyboardButton("📝 Log Trade", callback_data="menu_log"), InlineKeyboardButton("✅ Close Trade", callback_data="menu_close")],
         [InlineKeyboardButton("💰 Balance", callback_data="menu_balance"), InlineKeyboardButton("⚙ My Accounts", callback_data="menu_accounts")],
@@ -101,7 +101,7 @@ def main_menu(uid=None): # FIXED: now takes uid to hide admin
         [InlineKeyboardButton("📈 My Pairs", callback_data="menu_pairs"), InlineKeyboardButton("📜 Trade History", callback_data="menu_hist")],
         [InlineKeyboardButton("➕ Add Account", callback_data="menu_add"), InlineKeyboardButton("💸 Profit Tracker", callback_data="menu_profit")],
     ]
-    if uid and is_admin(uid): # FIXED: hide for non-admins
+    if uid and is_admin(uid):
         rows.append([InlineKeyboardButton("👑 ADMIN PANEL", callback_data="menu_admin")])
     return InlineKeyboardMarkup(rows)
 
@@ -113,20 +113,24 @@ def profit_menu():
         [InlineKeyboardButton("💳 Challenge Buy", callback_data="profit_challenge"), InlineKeyboardButton("💰 Live Deposit", callback_data="profit_deposit")],
         [InlineKeyboardButton("💸 Log Payout", callback_data="profit_payout"), InlineKeyboardButton("💵 Withdraw", callback_data="profit_withdraw")],
         [InlineKeyboardButton("📊 View Stats", callback_data="profit_stats"), InlineKeyboardButton("🗑 Edit/Delete", callback_data="profit_edit")],
-        [InlineKeyboardButton("🔄 Reset All", callback_data="profit_reset"), InlineKeyboardButton("📜 Bank History", callback_data="profit_history")], # ADDED history
+        [InlineKeyboardButton("🔄 Reset All", callback_data="profit_reset"), InlineKeyboardButton("📜 Bank History", callback_data="profit_history")],
+        [InlineKeyboardButton("🧹 Clear Chat", callback_data="clear_chat")],  # ADDED
         [InlineKeyboardButton("⬅ Back", callback_data="back_main")]
     ])
 
 async def start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     get_user(update.effective_user.id)
     ctx.user_data.clear()
-    await update.message.reply_text("📊 Trading Journal", reply_markup=main_menu(update.effective_user.id)) # FIXED
+    await update.message.reply_text("📊 Trading Journal", reply_markup=main_menu(update.effective_user.id))
+
+async def clear_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):  # ADDED
+    await update.message.reply_text("🧹 To clear chat: tap my name at top → Clear History. I can't delete for you, but this wipes the view.")
 
 async def back_main(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
     await q.answer()
     ctx.user_data.clear()
-    await q.edit_message_text("📊 Trading Journal", reply_markup=main_menu(q.from_user.id)) # FIXED
+    await q.edit_message_text("📊 Trading Journal", reply_markup=main_menu(q.from_user.id))
 
 async def archive_acc(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
@@ -150,7 +154,7 @@ async def menu_cb(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
     await q.answer()
     d = q.data
-    ctx.user_data.clear() # FIXED: clear old state
+    ctx.user_data.clear()
     s = Session()
     u = get_user(q.from_user.id)
 
@@ -161,9 +165,31 @@ async def menu_cb(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         s.close()
         return await close_start(q, ctx)
     if d == "menu_balance":
-        net = sum(t.amount for t in s.query(CashTx).filter_by(user_id=u.id))
+        net = sum(t.amount for t in s.query(CashTx).filter_by(user_id=u.id)) or 0
         s.close()
-        await q.edit_message_text(f"💰 Bank Balance: ${net:.2f}", reply_markup=back_button())
+        # ADDED: reset/edit buttons
+        kb = [[InlineKeyboardButton("✏️ Edit", callback_data="bal_edit"), InlineKeyboardButton("🔄 Reset", callback_data="bal_reset")],
+              [InlineKeyboardButton("⬅ Back", callback_data="back_main")]]
+        await q.edit_message_text(f"💰 Bank Balance: ${net:.2f}", reply_markup=InlineKeyboardMarkup(kb))
+        return
+    if d == "bal_edit":  # ADDED
+        ctx.user_data['mode'] = 'bal_edit'
+        s.close()
+        await q.edit_message_text("Enter new bank balance:", reply_markup=back_button())
+        return
+    if d == "bal_reset":  # ADDED
+        s.close()
+        await q.edit_message_text("Reset bank to $0?", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("✅ Yes", callback_data="bal_reset_yes"), InlineKeyboardButton("❌ No", callback_data="menu_balance")]]))
+        return
+    if d == "bal_reset_yes":  # ADDED
+        s.query(CashTx).filter_by(user_id=u.id).delete()
+        s.commit()
+        s.close()
+        await q.edit_message_text("✅ Bank reset", reply_markup=back_button())
+        return
+    if d == "clear_chat":  # ADDED
+        s.close()
+        await q.edit_message_text("🧹 Tap my name → Clear History to wipe chat.", reply_markup=back_button())
         return
     if d == "menu_accounts":
         accs = s.query(Account).filter_by(user_id=u.id, status='ACTIVE').all()
@@ -212,7 +238,7 @@ async def menu_cb(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         trades = s.query(Trade).filter_by(user_id=u.id).order_by(Trade.opened_at.desc()).limit(5).all()
         msg = "📖 Last Trades\n\n"
         for t in trades:
-            msg += f"{t.opened_at.strftime('%d/%m')} {t.symbol} {t.direction}\n"
+            msg += f"{t.opened_at.strftime('%d/%m/%Y')} {t.symbol} {t.direction}\n"  # ADDED year
         kb = [[InlineKeyboardButton(f"View {t.symbol}", callback_data=f"view_{t.id}")] for t in trades]
         kb.append([InlineKeyboardButton("⬅ Back", callback_data="back_main")])
         s.close()
@@ -272,11 +298,11 @@ async def profit_cb(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         withdraws = s.query(func.sum(CashTx.amount)).filter_by(user_id=u.id, type='WITHDRAW').scalar() or 0
         net = fees + payouts + withdraws
         await q.edit_message_text(f"📊 Stats\nFees: ${abs(fees):.2f}\nPayouts: ${payouts:.2f}\nWithdraws: ${withdraws:.2f}\nNet: ${net:.2f}", reply_markup=back_button())
-    elif d == "profit_history": # ADDED
+    elif d == "profit_history":
         txs = s.query(CashTx).filter_by(user_id=u.id).order_by(CashTx.date.desc()).limit(20).all()
         msg = "📜 Bank History\n\n"
         for t in txs:
-            msg += f"{t.date.strftime('%d/%m')} {t.type} ${t.amount:+.2f} - {t.note}\n"
+            msg += f"{t.date.strftime('%d/%m/%Y')} {t.type} ${t.amount:+.2f} - {t.note}\n"  # ADDED year
         await q.edit_message_text(msg or "No transactions", reply_markup=back_button())
     elif d == "profit_reset":
         await q.edit_message_text("Delete ALL data?", reply_markup=InlineKeyboardMarkup([
@@ -358,7 +384,6 @@ async def close_cb(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     ctx.user_data['close'] = {'id': q.data[3:], 'step': 'photo'}
     await q.edit_message_text("Send AFTER photo", reply_markup=back_button())
 
-# ADDED: Admin and Pair handlers
 async def admin_cb(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
     await q.answer()
@@ -386,6 +411,16 @@ async def pair_cb(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         s.commit()
         await q.edit_message_text("✅ Pair deleted", reply_markup=back_button())
     s.close()
+
+async def delacc_cb(update: Update, ctx: ContextTypes.DEFAULT_TYPE):  # ADDED
+    q = update.callback_query
+    await q.answer()
+    aid = q.data[7:]
+    s = Session()
+    s.query(Account).filter_by(id=aid).delete()
+    s.commit()
+    s.close()
+    await q.edit_message_text("✅ Account deleted", reply_markup=back_button())
 
 async def text_handler(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     mode = ctx.user_data.get('mode')
@@ -449,12 +484,20 @@ async def text_handler(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             s.commit()
             await update.message.reply_text(f"✅ Payout ${net:.2f}", reply_markup=main_menu(update.effective_user.id))
         ctx.user_data.clear()
-    elif mode == 'pair_add': # ADDED
+    elif mode == 'pair_add':
         sym = txt.upper().replace("/", "")
         s.add(Pair(user_id=u.id, symbol=sym))
         s.commit()
         ctx.user_data.clear()
         await update.message.reply_text(f"✅ Pair added: {sym}", reply_markup=main_menu(update.effective_user.id))
+    elif mode == 'bal_edit':  # ADDED
+        new_amt = float(txt)
+        current = sum(t.amount for t in s.query(CashTx).filter_by(user_id=u.id)) or 0
+        diff = new_amt - current
+        s.add(CashTx(user_id=u.id, type='ADJUST', amount=diff, note='Manual edit'))
+        s.commit()
+        ctx.user_data.clear()
+        await update.message.reply_text(f"✅ Bank set to ${new_amt:.2f}", reply_markup=main_menu(update.effective_user.id))
     elif mode == 'trade':
         t = ctx.user_data['trade']
         step = t.get('step')
@@ -496,8 +539,11 @@ async def photo_handler(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 def main():
     app = Application.builder().token(os.getenv("TELEGRAM_BOT_TOKEN")).build()
     app.add_handler(CommandHandler("start", start))
+    app.add_handler(CommandHandler("clear", clear_cmd))  # ADDED
     app.add_handler(CallbackQueryHandler(back_main, pattern="^back_main$"))
     app.add_handler(CallbackQueryHandler(menu_cb, pattern="^menu_"))
+    app.add_handler(CallbackQueryHandler(menu_cb, pattern="^bal_"))  # ADDED
+    app.add_handler(CallbackQueryHandler(menu_cb, pattern="^clear_"))  # ADDED
     app.add_handler(CallbackQueryHandler(profit_cb, pattern="^profit_"))
     app.add_handler(CallbackQueryHandler(archive_acc, pattern="^arch_"))
     app.add_handler(CallbackQueryHandler(wd_select, pattern="^wd_"))
@@ -505,8 +551,9 @@ def main():
     app.add_handler(CallbackQueryHandler(trade_acc_cb, pattern="^ta_"))
     app.add_handler(CallbackQueryHandler(trade_pair_cb, pattern="^tp_"))
     app.add_handler(CallbackQueryHandler(close_cb, pattern="^tc_"))
-    app.add_handler(CallbackQueryHandler(admin_cb, pattern="^admin_")) # ADDED
-    app.add_handler(CallbackQueryHandler(pair_cb, pattern="^pair")) # ADDED
+    app.add_handler(CallbackQueryHandler(admin_cb, pattern="^admin_"))
+    app.add_handler(CallbackQueryHandler(pair_cb, pattern="^pair"))
+    app.add_handler(CallbackQueryHandler(delacc_cb, pattern="^delacc_"))  # ADDED
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, text_handler))
     app.add_handler(MessageHandler(filters.PHOTO, photo_handler))
     app.run_polling()
