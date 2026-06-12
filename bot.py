@@ -449,38 +449,80 @@ async def close_res_cb(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     await q.answer()
     res = q.data.split('_')[1]
     ctx.user_data['close']['result'] = res
-    ctx.user_data['close']['step'] = 'pnl_list'
-    ctx.user_data['close']['idx'] = 0
-
-    s = Session()
+    ctx.user_data['close']['step'] = 'pnl_menu'
     tid = ctx.user_data['close']['id']
+    s = Session()
     tas = s.query(TradeAccount).filter_by(trade_id=tid).all()
-    ctx.user_data['close']['tas'] = [ta.account_id for ta in tas]
+    ctx.user_data['close']['tas'] = {ta.account_id: ta.pnl_usd for ta in tas}
     s.close()
-
     if not tas:
         await q.edit_message_text("No accounts linked to this trade", reply_markup=back_button())
         return
+    await show_close_accounts_menu(q, ctx)
 
-    await ask_next_pnl(q, ctx)
-
-async def ask_next_pnl(q, ctx):
-    idx = ctx.user_data['close']['idx']
-    acc_ids = ctx.user_data['close']['tas']
+async def show_close_accounts_menu(q_or_update, ctx):
+    tid = ctx.user_data['close']['id']
     res = ctx.user_data['close']['result']
-
+    acc_pnls = ctx.user_data['close']['tas']
     s = Session()
-    acc = s.query(Account).get(acc_ids[idx])
+    kb = []
+    all_done = True
+    for acc_id, pnl in acc_pnls.items():
+        acc = s.query(Account).get(acc_id)
+        if pnl is None:
+            kb.append([InlineKeyboardButton(f"[ ] {acc.name}", callback_data=f"closeacc_{tid}_{acc_id}")])
+            all_done = False
+        else:
+            kb.append([InlineKeyboardButton(f"[✅ ${pnl:+.0f}] {acc.name}", callback_data=f"closeacc_{tid}_{acc_id}")])
+    if all_done:
+        kb.append([InlineKeyboardButton("✅ DONE - Close Trade", callback_data="closeacc_done")])
+    else:
+        kb.append([InlineKeyboardButton("⬅ Back", callback_data="back_main")])
     s.close()
+    text = f"{res} hit. Click each account to enter PnL:"
+    if isinstance(q_or_update, Update):
+        await q_or_update.message.reply_text(text, reply_markup=InlineKeyboardMarkup(kb))
+    else:
+        await q_or_update.edit_message_text(text, reply_markup=InlineKeyboardMarkup(kb))
 
-    total = len(acc_ids)
+async def close_acc_select(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    await q.answer()
+    data = q.data.split('_')
+    if data[1] == "done":
+        tid = ctx.user_data['close']['id']
+        s = Session()
+        tr = s.query(Trade).get(tid)
+        tr.closed_at = datetime.utcnow()
+        for acc_id, pnl in ctx.user_data['close']['tas'].items():
+            ta = s.query(TradeAccount).filter_by(trade_id=tid, account_id=acc_id).first()
+            ta.pnl_usd = pnl
+            ta.result = ctx.user_data['close']['result']
+            ta.closed_at = datetime.utcnow()
+            acc = s.query(Account).get(acc_id)
+            acc.current_balance += pnl
+        s.commit()
+        s.close()
+        ctx.user_data.clear()
+        await q.edit_message_text("✅ Trade closed. All accounts updated.", reply_markup=main_menu(q.from_user.id))
+        return
+    tid, acc_id = data[1], data[2]
+    ctx.user_data['mode'] = 'close_pnl'
+    ctx.user_data['close']['current_acc'] = acc_id
+    s = Session()
+    acc = s.query(Account).get(acc_id)
+    s.close()
     await q.edit_message_text(
-        f"{res} hit. Enter PnL for account {idx+1}/{total}:\n\n"
-        f"💼 {acc.name} ({acc.type})\n"
-        f"Current: ${acc.current_balance:.2f}\n\n"
-        f"Send the dollar amount. Use - for loss.",
-        reply_markup=back_button()
+        f"Enter PnL for {acc.name}:\nCurrent balance: ${acc.current_balance:.2f}\n\n"
+        f"Send dollar amount. Use - for loss, + for profit.",
+        reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("⬅ Back to list", callback_data="closeacc_back")]])
     )
+
+async def close_acc_back(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    await q.answer()
+    ctx.user_data['mode'] = 'close'
+    await show_close_accounts_menu(q, ctx)
 
 async def admin_cb(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
@@ -629,41 +671,4 @@ async def text_handler(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         s.commit()
         ctx.user_data.clear()
         await update.message.reply_text(f"✅ Bank set to ${new_amt:.2f}", reply_markup=main_menu(update.effective_user.id))
-    elif mode == 'close':
-        if ctx.user_data.get('close', {}).get('step') == 'pnl_list':
-            amt = float(txt)
-            res = ctx.user_data['close']['result']
-            pnl = -abs(amt) if res == 'SL' else abs(amt)
-
-            idx = ctx.user_data['close']['idx']
-            acc_id = ctx.user_data['close']['tas'][idx]
-            tid = ctx.user_data['close']['id']
-
-            ta = s.query(TradeAccount).filter_by(trade_id=tid, account_id=acc_id).first()
-            ta.pnl_usd = pnl
-            ta.result = res
-            ta.closed_at = datetime.utcnow()
-            acc = s.query(Account).get(acc_id)
-            acc.current_balance += pnl
-
-            idx += 1
-            if idx < len(ctx.user_data['close']['tas']):
-                ctx.user_data['close']['idx'] = idx
-                s.commit()
-                acc = s.query(Account).get(ctx.user_data['close']['tas'][idx])
-                total = len(ctx.user_data['close']['tas'])
-                await update.message.reply_text(
-                    f"{res} hit. Enter PnL for account {idx+1}/{total}:\n\n"
-                    f"💼 {acc.name} ({acc.type})\n"
-                    f"Current: ${acc.current_balance:.2f}\n\n"
-                    f"Send the dollar amount. Use - for loss.",
-                    reply_markup=back_button()
-                )
-                s.close()
-            else:
-                tr = s.query(Trade).get(tid)
-                tr.closed_at = datetime.utcnow()
-                s.commit()
-                s.close()
-                ctx.user_data.clear()
-                await update.message.reply_text(f"✅ Trade closed. Each account updated.", reply_markup=main_menu(update
+    elif mode == 'close_p
