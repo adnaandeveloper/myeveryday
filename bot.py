@@ -10,7 +10,6 @@ from datetime import datetime
 import uuid
 import calendar
 
-# ==================== DATABASE MODELS ====================
 Base = declarative_base()
 def uid(): return str(uuid.uuid4())
 
@@ -73,7 +72,6 @@ class CashTx(Base):
     note = Column(Text)
     date = Column(DateTime, default=datetime.utcnow)
 
-# ==================== SETUP ====================
 DATABASE_URL = os.getenv("DATABASE_URL", "sqlite:///./edgeflo.db")
 ADMIN_IDS = os.getenv("ADMIN_IDS", "").split(",")
 engine = create_engine(DATABASE_URL, future=True)
@@ -131,7 +129,7 @@ async def start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("📊 Trading Journal", reply_markup=main_menu(update.effective_user.id))
 
 async def clear_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("🧹 Tap my name → Clear History to clean chat.")
+    await update.message.reply_text("🧹 Tap my name → Clear History")
 
 async def back_main(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
@@ -205,7 +203,8 @@ async def menu_cb(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         s.close()
         await q.edit_message_text("✅ Bank reset", reply_markup=back_button())
         return
-    if d == "clear_chat":
+
+            if d == "clear_chat":
         s.close()
         await q.edit_message_text("🧹 Tap my name → Clear History.", reply_markup=back_button())
         return
@@ -407,7 +406,7 @@ async def dir_cb(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     ctx.user_data['trade']['step'] = 'photo'
     await q.edit_message_text("Send BEFORE photo", reply_markup=back_button())
 
-async def cut_cb(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    async def cut_cb(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
     await q.answer()
     cut = float(q.data.split('_')[1])
@@ -532,18 +531,35 @@ async def close_acc_back(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 async def journal_month_cb(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
     await q.answer()
+    if 'last_photos' in ctx.user_data:
+        for msg_id in ctx.user_data['last_photos']:
+            try:
+                await q.message.chat.delete_message(msg_id)
+            except:
+                pass
+        ctx.user_data.pop('last_photos')
     _, year, month = q.data.split('_')
     year, month = int(year), int(month)
     s = Session()
     u = get_user(q.from_user.id)
     trades = s.query(Trade).filter_by(user_id=u.id).filter(extract('year', Trade.opened_at) == year).filter(extract('month', Trade.opened_at) == month).order_by(Trade.opened_at.desc()).all()
-    s.close()
     kb = []
     for t in trades:
         date_str = t.opened_at.strftime('%d %b')
-        status = "✅" if t.closed_at else "🟢"
+        if not t.closed_at:
+            status = "🟢"
+        else:
+            tas = s.query(TradeAccount).filter_by(trade_id=t.id).all()
+            total_pnl = sum(ta.pnl_usd or 0 for ta in tas)
+            if total_pnl > 0:
+                status = "✅"
+            elif total_pnl < 0:
+                status = "❌"
+            else:
+                status = "➖"
         kb.append([InlineKeyboardButton(f"{date_str} {t.symbol} {t.direction} {status}", callback_data=f"view_{t.id}")])
     kb.append([InlineKeyboardButton("⬅ Back to Months", callback_data="menu_journal")])
+    s.close()
     month_name = calendar.month_name[month]
     await q.edit_message_text(f"📖 {month_name} {year} - {len(trades)} trades", reply_markup=InlineKeyboardMarkup(kb))
 
@@ -567,17 +583,22 @@ async def view_trade_cb(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         for ta in tas:
             acc = s.query(Account).get(ta.account_id)
             if ta.pnl_usd is not None:
-                msg += f"• {acc.name}: ${ta.pnl_usd:+.2f} ({ta.result})\n"
+                icon = "✅" if ta.pnl_usd > 0 else "❌" if ta.pnl_usd < 0 else "➖"
+                msg += f"{icon} {acc.name}: ${ta.pnl_usd:+.2f} ({ta.result})\n"
             else:
-                msg += f"• {acc.name}: Open\n"
+                msg += f"🟢 {acc.name}: Open\n"
     year = tr.opened_at.year
     month = tr.opened_at.month
     kb = [[InlineKeyboardButton("⬅ Back to Month", callback_data=f"journal_{year}_{month}")]]
     await q.edit_message_text(msg, reply_markup=InlineKeyboardMarkup(kb))
+    photo_ids = []
     if tr.before_photo:
-        await q.message.reply_photo(tr.before_photo, caption="📸 BEFORE")
+        m1 = await q.message.reply_photo(tr.before_photo, caption="📸 BEFORE")
+        photo_ids.append(m1.message_id)
     if tr.after_photo:
-        await q.message.reply_photo(tr.after_photo, caption="📸 AFTER")
+        m2 = await q.message.reply_photo(tr.after_photo, caption="📸 AFTER")
+        photo_ids.append(m2.message_id)
+    ctx.user_data['last_photos'] = photo_ids
     s.close()
 
 async def admin_cb(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
