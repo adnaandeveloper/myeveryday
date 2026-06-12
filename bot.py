@@ -449,80 +449,8 @@ async def close_res_cb(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     await q.answer()
     res = q.data.split('_')[1]
     ctx.user_data['close']['result'] = res
-    ctx.user_data['close']['step'] = 'pnl_menu'
-    tid = ctx.user_data['close']['id']
-    s = Session()
-    tas = s.query(TradeAccount).filter_by(trade_id=tid).all()
-    ctx.user_data['close']['tas'] = {ta.account_id: ta.pnl_usd for ta in tas}
-    s.close()
-    if not tas:
-        await q.edit_message_text("No accounts linked to this trade", reply_markup=back_button())
-        return
-    await show_close_accounts_menu(q, ctx)
-
-async def show_close_accounts_menu(q_or_update, ctx):
-    tid = ctx.user_data['close']['id']
-    res = ctx.user_data['close']['result']
-    acc_pnls = ctx.user_data['close']['tas']
-    s = Session()
-    kb = []
-    all_done = True
-    for acc_id, pnl in acc_pnls.items():
-        acc = s.query(Account).get(acc_id)
-        if pnl is None:
-            kb.append([InlineKeyboardButton(f"[ ] {acc.name}", callback_data=f"closeacc_{tid}_{acc_id}")])
-            all_done = False
-        else:
-            kb.append([InlineKeyboardButton(f"[✅ ${pnl:+.0f}] {acc.name}", callback_data=f"closeacc_{tid}_{acc_id}")])
-    if all_done:
-        kb.append([InlineKeyboardButton("✅ DONE - Close Trade", callback_data="closeacc_done")])
-    else:
-        kb.append([InlineKeyboardButton("⬅ Back", callback_data="back_main")])
-    s.close()
-    text = f"{res} hit. Click each account to enter PnL:"
-    if isinstance(q_or_update, Update):
-        await q_or_update.message.reply_text(text, reply_markup=InlineKeyboardMarkup(kb))
-    else:
-        await q_or_update.edit_message_text(text, reply_markup=InlineKeyboardMarkup(kb))
-
-async def close_acc_select(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    q = update.callback_query
-    await q.answer()
-    data = q.data.split('_')
-    if data[1] == "done":
-        tid = ctx.user_data['close']['id']
-        s = Session()
-        tr = s.query(Trade).get(tid)
-        tr.closed_at = datetime.utcnow()
-        for acc_id, pnl in ctx.user_data['close']['tas'].items():
-            ta = s.query(TradeAccount).filter_by(trade_id=tid, account_id=acc_id).first()
-            ta.pnl_usd = pnl
-            ta.result = ctx.user_data['close']['result']
-            ta.closed_at = datetime.utcnow()
-            acc = s.query(Account).get(acc_id)
-            acc.current_balance += pnl
-        s.commit()
-        s.close()
-        ctx.user_data.clear()
-        await q.edit_message_text("✅ Trade closed. All accounts updated.", reply_markup=main_menu(q.from_user.id))
-        return
-    tid, acc_id = data[1], data[2]
-    ctx.user_data['mode'] = 'close_pnl'
-    ctx.user_data['close']['current_acc'] = acc_id
-    s = Session()
-    acc = s.query(Account).get(acc_id)
-    s.close()
-    await q.edit_message_text(
-        f"Enter PnL for {acc.name}:\nCurrent balance: ${acc.current_balance:.2f}\n\n"
-        f"Send dollar amount. Use - for loss, + for profit.",
-        reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("⬅ Back to list", callback_data="closeacc_back")]])
-    )
-
-async def close_acc_back(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    q = update.callback_query
-    await q.answer()
-    ctx.user_data['mode'] = 'close'
-    await show_close_accounts_menu(q, ctx)
+    ctx.user_data['close']['step'] = 'pnl'
+    await q.edit_message_text(f"{res} hit. How much?", reply_markup=back_button())
 
 async def admin_cb(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
@@ -671,4 +599,77 @@ async def text_handler(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         s.commit()
         ctx.user_data.clear()
         await update.message.reply_text(f"✅ Bank set to ${new_amt:.2f}", reply_markup=main_menu(update.effective_user.id))
-    elif mode == 'close_p
+    elif mode == 'close':
+        if ctx.user_data.get('close', {}).get('step') == 'pnl':
+            amt = float(txt)
+            res = ctx.user_data['close']['result']
+            pnl = -abs(amt) if res == 'SL' else abs(amt)
+            tid = ctx.user_data['close']['id']
+            tr = s.query(Trade).get(tid)
+            tr.closed_at = datetime.utcnow()
+            tas = s.query(TradeAccount).filter_by(trade_id=tid).all()
+            for ta in tas:
+                ta.pnl_usd = pnl
+                ta.result = res
+                ta.closed_at = datetime.utcnow()
+                acc = s.query(Account).get(ta.account_id)
+                acc.current_balance += pnl
+            s.commit()
+            ctx.user_data.clear()
+            await update.message.reply_text(f"✅ Closed {res} ${pnl:+.2f}", reply_markup=main_menu(update.effective_user.id))
+    s.close()
+
+async def photo_handler(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    mode = ctx.user_data.get('mode')
+    s = Session()
+    u = get_user(update.effective_user.id)
+    if mode == 'trade' and ctx.user_data.get('trade', {}).get('step') == 'photo':
+        t = ctx.user_data['trade']
+        tr = Trade(user_id=u.id, symbol=t['symbol'], direction=t['direction'], before_photo=update.message.photo[-1].file_id)
+        s.add(tr)
+        s.flush()
+        for aid in t['acc_ids']:
+            s.add(TradeAccount(trade_id=tr.id, account_id=aid))
+        s.commit()
+        ctx.user_data.clear()
+        await update.message.reply_text(f"✅ Trade {tr.symbol} {tr.direction} logged", reply_markup=main_menu(update.effective_user.id))
+    elif mode == 'close' and ctx.user_data.get('close', {}).get('step') == 'photo':
+        tid = ctx.user_data['close']['id']
+        tr = s.query(Trade).get(tid)
+        tr.after_photo = update.message.photo[-1].file_id
+        s.commit()
+        ctx.user_data['close']['step'] = 'result'
+        await update.message.reply_text("SL or TP?", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("SL ❌", callback_data="res_SL"), InlineKeyboardButton("TP ✅", callback_data="res_TP")]]))
+    s.close()
+
+def main():
+    app = Application.builder().token(os.getenv("TELEGRAM_BOT_TOKEN")).build()
+    app.add_handler(CommandHandler("start", start))
+    app.add_handler(CommandHandler("clear", clear_cmd))
+    app.add_handler(CallbackQueryHandler(back_main, pattern="^back_main$"))
+    app.add_handler(CallbackQueryHandler(menu_cb, pattern="^menu_"))
+    app.add_handler(CallbackQueryHandler(menu_cb, pattern="^bal_"))
+    app.add_handler(CallbackQueryHandler(menu_cb, pattern="^clear_"))
+    app.add_handler(CallbackQueryHandler(menu_cb, pattern="^add_"))
+    app.add_handler(CallbackQueryHandler(profit_cb, pattern="^profit_"))
+    app.add_handler(CallbackQueryHandler(archive_acc, pattern="^arch_"))
+    app.add_handler(CallbackQueryHandler(wd_select, pattern="^wd_"))
+    app.add_handler(CallbackQueryHandler(payout_select, pattern="^payout_"))
+    app.add_handler(CallbackQueryHandler(deposit_select, pattern="^deposit_"))
+    app.add_handler(CallbackQueryHandler(reset_yes, pattern="^reset_yes$"))
+    app.add_handler(CallbackQueryHandler(trade_acc_cb, pattern="^ta_"))
+    app.add_handler(CallbackQueryHandler(trade_pair_cb, pattern="^tp_"))
+    app.add_handler(CallbackQueryHandler(dir_cb, pattern="^dir_"))
+    app.add_handler(CallbackQueryHandler(cut_cb, pattern="^cut_"))
+    app.add_handler(CallbackQueryHandler(close_cb, pattern="^tc_"))
+    app.add_handler(CallbackQueryHandler(close_res_cb, pattern="^res_"))
+    app.add_handler(CallbackQueryHandler(admin_cb, pattern="^admin_"))
+    app.add_handler(CallbackQueryHandler(pair_cb, pattern="^pair"))
+    app.add_handler(CallbackQueryHandler(delacc_cb, pattern="^delacc_"))
+    app.add_handler(CallbackQueryHandler(view_trade_cb, pattern="^view_"))
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, text_handler))
+    app.add_handler(MessageHandler(filters.PHOTO, photo_handler))
+    app.run_polling()
+
+if __name__ == "__main__":
+    main()
