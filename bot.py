@@ -174,6 +174,7 @@ async def menu_cb(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     ctx.user_data.clear()
     s = Session()
     u = get_user(q.from_user.id)
+
     if d == "menu_log":
         s.close()
         return await trade_start(q, ctx)
@@ -267,7 +268,7 @@ async def menu_cb(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         return
     if d == "menu_journal":
         trades = s.query(Trade).filter_by(user_id=u.id).order_by(Trade.opened_at.desc()).limit(5).all()
-        msg = "📖 Last Trades\n\n"
+        msg = "📖 Last Trades\n"
         for t in trades:
             msg += f"{t.opened_at.strftime('%d/%m/%Y')} {t.symbol} {t.direction}\n"
         kb = [[InlineKeyboardButton(f"View {t.symbol}", callback_data=f"view_{t.id}")] for t in trades]
