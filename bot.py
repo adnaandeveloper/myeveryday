@@ -442,7 +442,7 @@ async def close_res_cb(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     tas = s.query(TradeAccount).filter_by(trade_id=tid).all()
     s.close()
     if not tas:
-        await q.edit_message_text("No accounts linked to this trade", reply_markup=back_button())
+        await q.edit_message_text("❌ No accounts linked to this trade (it was logged before the update). Log a new trade with 'All Accounts'.", reply_markup=back_button())
         return
     ctx.user_data['close']['tas'] = {ta.account_id: ta.pnl_usd for ta in tas}
     await show_close_accounts_menu(q, ctx)
@@ -456,6 +456,8 @@ async def show_close_accounts_menu(q_or_update, ctx):
     all_done = True
     for acc_id, pnl in acc_pnls.items():
         acc = s.query(Account).get(acc_id)
+        if not acc:
+            continue
         if pnl is None:
             kb.append([InlineKeyboardButton(f"[ ] {acc.name}", callback_data=f"closeacc_{tid}_{acc_id}")])
             all_done = False
@@ -466,7 +468,7 @@ async def show_close_accounts_menu(q_or_update, ctx):
     else:
         kb.append([InlineKeyboardButton("⬅ Back", callback_data="back_main")])
     s.close()
-    text = f"{res} hit. Click each account to enter PnL:"
+    text = f"{res} hit. Tap each account to enter PnL:"
     if isinstance(q_or_update, Update):
         await q_or_update.message.reply_text(text, reply_markup=InlineKeyboardMarkup(kb))
     else:
