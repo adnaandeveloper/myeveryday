@@ -352,7 +352,7 @@ async def profit_cb(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         await q.edit_message_text("Delete account:", reply_markup=InlineKeyboardMarkup(kb))
     s.close()
 
-async def reset_yes(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    async def reset_yes(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
     await q.answer()
     s = Session()
@@ -449,8 +449,79 @@ async def close_res_cb(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     await q.answer()
     res = q.data.split('_')[1]
     ctx.user_data['close']['result'] = res
-    ctx.user_data['close']['step'] = 'pnl'
-    await q.edit_message_text(f"{res} hit. How much?", reply_markup=back_button())
+    tid = ctx.user_data['close']['id']
+    s = Session()
+    tas = s.query(TradeAccount).filter_by(trade_id=tid).all()
+    s.close()
+    if not tas:
+        await q.edit_message_text("No accounts linked to this trade", reply_markup=back_button())
+        return
+    ctx.user_data['close']['tas'] = {ta.account_id: ta.pnl_usd for ta in tas}
+    await show_close_accounts_menu(q, ctx)
+
+async def show_close_accounts_menu(q_or_update, ctx):
+    tid = ctx.user_data['close']['id']
+    res = ctx.user_data['close']['result']
+    acc_pnls = ctx.user_data['close']['tas']
+    s = Session()
+    kb = []
+    all_done = True
+    for acc_id, pnl in acc_pnls.items():
+        acc = s.query(Account).get(acc_id)
+        if pnl is None:
+            kb.append([InlineKeyboardButton(f"[ ] {acc.name}", callback_data=f"closeacc_{tid}_{acc_id}")])
+            all_done = False
+        else:
+            kb.append([InlineKeyboardButton(f"[✅ ${pnl:+.0f}] {acc.name}", callback_data=f"closeacc_{tid}_{acc_id}")])
+    if all_done:
+        kb.append([InlineKeyboardButton("✅ DONE - Close Trade", callback_data="closeacc_done")])
+    else:
+        kb.append([InlineKeyboardButton("⬅ Back", callback_data="back_main")])
+    s.close()
+    text = f"{res} hit. Click each account to enter PnL:"
+    if isinstance(q_or_update, Update):
+        await q_or_update.message.reply_text(text, reply_markup=InlineKeyboardMarkup(kb))
+    else:
+        await q_or_update.edit_message_text(text, reply_markup=InlineKeyboardMarkup(kb))
+
+async def close_acc_select(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    await q.answer()
+    data = q.data.split('_')
+    if data[1] == "done":
+        tid = ctx.user_data['close']['id']
+        s = Session()
+        tr = s.query(Trade).get(tid)
+        tr.closed_at = datetime.utcnow()
+        for acc_id, pnl in ctx.user_data['close']['tas'].items():
+            ta = s.query(TradeAccount).filter_by(trade_id=tid, account_id=acc_id).first()
+            ta.pnl_usd = pnl
+            ta.result = ctx.user_data['close']['result']
+            ta.closed_at = datetime.utcnow()
+            acc = s.query(Account).get(acc_id)
+            acc.current_balance += pnl
+        s.commit()
+        s.close()
+        ctx.user_data.clear()
+        await q.edit_message_text("✅ Trade closed. All accounts updated.", reply_markup=main_menu(q.from_user.id))
+        return
+    tid, acc_id = data[1], data[2]
+    ctx.user_data['mode'] = 'close_pnl'
+    ctx.user_data['close']['current_acc'] = acc_id
+    s = Session()
+    acc = s.query(Account).get(acc_id)
+    s.close()
+    await q.edit_message_text(
+        f"Enter PnL for {acc.name}:\nCurrent balance: ${acc.current_balance:.2f}\n\n"
+        f"Send dollar amount. Use - for loss, + for profit.",
+        reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("⬅ Back to list", callback_data="closeacc_back")]])
+    )
+
+async def close_acc_back(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    await q.answer()
+    ctx.user_data['mode'] = 'close'
+    await show_close_accounts_menu(q, ctx)
 
 async def admin_cb(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
@@ -519,6 +590,7 @@ async def text_handler(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     txt = update.message.text.strip()
     s = Session()
     u = get_user(update.effective_user.id)
+
     if mode == 'new_acc':
         step = ctx.user_data.get('step', 1)
         atype = ctx.user_data.get('atype')
@@ -549,6 +621,7 @@ async def text_handler(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
                 [InlineKeyboardButton("10%", callback_data="cut_10"), InlineKeyboardButton("15%", callback_data="cut_15")],
                 [InlineKeyboardButton("20%", callback_data="cut_20"), InlineKeyboardButton("25%", callback_data="cut_25")]
             ]))
+
     elif mode == 'withdraw':
         amt = float(txt)
         acc = s.query(Account).get(ctx.user_data['wd_acc'])
@@ -557,6 +630,7 @@ async def text_handler(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         s.commit()
         ctx.user_data.clear()
         await update.message.reply_text(f"✅ Withdrew ${amt} from {acc.name} to bank", reply_markup=main_menu(update.effective_user.id))
+
     elif mode == 'payout':
         gross = float(txt)
         acc = s.query(Account).get(ctx.user_data['payout_acc'])
@@ -567,6 +641,7 @@ async def text_handler(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         s.commit()
         ctx.user_data.clear()
         await update.message.reply_text(f"✅ Payout: ${gross} → Bank +${net:.2f} ({cut}% fee)", reply_markup=main_menu(update.effective_user.id))
+
     elif mode == 'deposit':
         amt = float(txt)
         acc = s.query(Account).get(ctx.user_data['deposit_acc'])
@@ -575,6 +650,7 @@ async def text_handler(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         s.commit()
         ctx.user_data.clear()
         await update.message.reply_text(f"✅ Deposited ${amt} to {acc.name} (Bank -${amt})", reply_markup=main_menu(update.effective_user.id))
+
     elif mode == 'quick':
         qt = ctx.user_data['qt']
         if qt == 'challenge':
@@ -585,12 +661,14 @@ async def text_handler(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             s.commit()
             await update.message.reply_text(f"✅ {name} added", reply_markup=main_menu(update.effective_user.id))
         ctx.user_data.clear()
+
     elif mode == 'pair_add':
         sym = txt.upper().replace("/", "")
         s.add(Pair(user_id=u.id, symbol=sym))
         s.commit()
         ctx.user_data.clear()
         await update.message.reply_text(f"✅ Pair added: {sym}", reply_markup=main_menu(update.effective_user.id))
+
     elif mode == 'bal_edit':
         new_amt = float(txt)
         current = sum(t.amount for t in s.query(CashTx).filter_by(user_id=u.id)) or 0
@@ -599,24 +677,17 @@ async def text_handler(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         s.commit()
         ctx.user_data.clear()
         await update.message.reply_text(f"✅ Bank set to ${new_amt:.2f}", reply_markup=main_menu(update.effective_user.id))
-    elif mode == 'close':
-        if ctx.user_data.get('close', {}).get('step') == 'pnl':
-            amt = float(txt)
-            res = ctx.user_data['close']['result']
-            pnl = -abs(amt) if res == 'SL' else abs(amt)
-            tid = ctx.user_data['close']['id']
-            tr = s.query(Trade).get(tid)
-            tr.closed_at = datetime.utcnow()
-            tas = s.query(TradeAccount).filter_by(trade_id=tid).all()
-            for ta in tas:
-                ta.pnl_usd = pnl
-                ta.result = res
-                ta.closed_at = datetime.utcnow()
-                acc = s.query(Account).get(ta.account_id)
-                acc.current_balance += pnl
-            s.commit()
-            ctx.user_data.clear()
-            await update.message.reply_text(f"✅ Closed {res} ${pnl:+.2f}", reply_markup=main_menu(update.effective_user.id))
+
+    elif mode == 'close_pnl':
+        try:
+            pnl = float(txt)
+            acc_id = ctx.user_data['close']['current_acc']
+            ctx.user_data['close']['tas'][acc_id] = pnl
+            ctx.user_data['mode'] = 'close'
+            await show_close_accounts_menu(update, ctx)
+        except ValueError:
+            await update.message.reply_text("Send a valid number like +400 or -150", reply_markup=back_button())
+
     s.close()
 
 async def photo_handler(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
@@ -663,6 +734,8 @@ def main():
     app.add_handler(CallbackQueryHandler(cut_cb, pattern="^cut_"))
     app.add_handler(CallbackQueryHandler(close_cb, pattern="^tc_"))
     app.add_handler(CallbackQueryHandler(close_res_cb, pattern="^res_"))
+    app.add_handler(CallbackQueryHandler(close_acc_select, pattern="^closeacc_"))
+    app.add_handler(CallbackQueryHandler(close_acc_back, pattern="^closeacc_back$"))
     app.add_handler(CallbackQueryHandler(admin_cb, pattern="^admin_"))
     app.add_handler(CallbackQueryHandler(pair_cb, pattern="^pair"))
     app.add_handler(CallbackQueryHandler(delacc_cb, pattern="^delacc_"))
