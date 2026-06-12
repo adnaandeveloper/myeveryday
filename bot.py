@@ -484,12 +484,14 @@ async def text_handler(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             if atype == 'CHALLENGE':
                 ctx.user_data['step'] = 3
                 await update.message.reply_text("Fee paid? (will be deducted from Bank)", reply_markup=back_button())
-            else: # LIVE
-                acc = Account(user_id=u.id, name=ctx.user_data['na_name'], type='LIVE', start_balance=ctx.user_data['na_bal'], current_balance=ctx.user_data['na_bal'], fee_paid=0)
-                s.add(acc)
-                s.commit()
-                ctx.user_data.clear()
-                await update.message.reply_text(f"✅ {acc.name} LIVE created", reply_markup=main_menu(update.effective_user.id))
+           else: # LIVE
+    acc = Account(user_id=u.id, name=ctx.user_data['na_name'], type='LIVE', start_balance=ctx.user_data['na_bal'], current_balance=ctx.user_data['na_bal'], fee_paid=0)
+    s.add(acc)
+    # >>> ADD THIS LINE <<<
+    s.add(CashTx(user_id=u.id, type='DEPOSIT', amount=-ctx.user_data['na_bal'], note=f"Fund {ctx.user_data['na_name']}"))
+    s.commit()
+    ctx.user_data.clear()
+    await update.message.reply_text(f"✅ {acc.name} LIVE created (Bank -${ctx.user_data['na_bal']})", reply_markup=main_menu(update.effective_user.id))
         elif step == 3: # CHALLENGE fee
             fee = float(txt)
             acc = Account(user_id=u.id, name=ctx.user_data['na_name'], type='CHALLENGE', start_balance=ctx.user_data['na_bal'], current_balance=ctx.user_data['na_bal'], fee_paid=fee)
