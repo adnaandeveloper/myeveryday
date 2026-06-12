@@ -111,6 +111,9 @@ def main_menu(uid=None):
 def back_button():
     return InlineKeyboardMarkup([[InlineKeyboardButton("⬅ Back to Menu", callback_data="back_main")]])
 
+def back_tools():
+    return InlineKeyboardMarkup([[InlineKeyboardButton("⬅ Back to Wallet", callback_data="menu_profit")]])
+
 def profit_menu():
     return InlineKeyboardMarkup([
         [InlineKeyboardButton("💳 Challenge Buy", callback_data="profit_challenge"), InlineKeyboardButton("💰 Live Deposit", callback_data="profit_deposit")],
@@ -151,21 +154,21 @@ async def wd_select(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     await q.answer()
     ctx.user_data['mode'] = 'withdraw'
     ctx.user_data['wd_acc'] = q.data[3:]
-    await q.edit_message_text("Amount to withdraw to bank?", reply_markup=back_button())
+    await q.edit_message_text("Amount to withdraw to bank?", reply_markup=back_tools())
 
 async def payout_select(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
     await q.answer()
     ctx.user_data['mode'] = 'payout'
     ctx.user_data['payout_acc'] = q.data[7:]
-    await q.edit_message_text("Gross payout amount?", reply_markup=back_button())
+    await q.edit_message_text("Gross payout amount?", reply_markup=back_tools())
 
 async def deposit_select(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
     await q.answer()
     ctx.user_data['mode'] = 'deposit'
     ctx.user_data['deposit_acc'] = q.data[8:]
-    await q.edit_message_text("How much to deposit?", reply_markup=back_button())
+    await q.edit_message_text("How much to deposit?", reply_markup=back_tools())
 
 async def menu_cb(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
@@ -309,42 +312,42 @@ async def profit_cb(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if d == "profit_withdraw":
         accs = s.query(Account).filter_by(user_id=u.id, status='ACTIVE').all()
         kb = [[InlineKeyboardButton(a.name, callback_data=f"wd_{a.id}")] for a in accs]
-        kb.append([InlineKeyboardButton("⬅ Back", callback_data="back_main")])
+        kb.append([InlineKeyboardButton("⬅ Back", callback_data="menu_profit")])
         await q.edit_message_text("Select account to withdraw FROM:", reply_markup=InlineKeyboardMarkup(kb))
     elif d == "profit_challenge":
         ctx.user_data['mode'] = 'quick'
         ctx.user_data['qt'] = 'challenge'
-        await q.edit_message_text("Send: NAME BALANCE FEE", reply_markup=back_button())
+        await q.edit_message_text("Send: NAME BALANCE FEE", reply_markup=back_tools())
     elif d == "profit_deposit":
         accs = s.query(Account).filter_by(user_id=u.id, status='ACTIVE', type='LIVE').all()
         kb = [[InlineKeyboardButton(a.name, callback_data=f"deposit_{a.id}")] for a in accs]
-        kb.append([InlineKeyboardButton("⬅ Back", callback_data="back_main")])
+        kb.append([InlineKeyboardButton("⬅ Back", callback_data="menu_profit")])
         await q.edit_message_text("Deposit to which LIVE account?", reply_markup=InlineKeyboardMarkup(kb))
     elif d == "profit_payout":
         accs = s.query(Account).filter_by(user_id=u.id, status='ACTIVE').all()
         kb = [[InlineKeyboardButton(f"{a.name} ({a.type})", callback_data=f"payout_{a.id}")] for a in accs]
-        kb.append([InlineKeyboardButton("⬅ Back", callback_data="back_main")])
+        kb.append([InlineKeyboardButton("⬅ Back", callback_data="menu_profit")])
         await q.edit_message_text("Payout from which account?", reply_markup=InlineKeyboardMarkup(kb))
     elif d == "profit_stats":
         fees = s.query(func.sum(CashTx.amount)).filter_by(user_id=u.id, type='FEE').scalar() or 0
         payouts = s.query(func.sum(CashTx.amount)).filter_by(user_id=u.id, type='PAYOUT').scalar() or 0
         withdraws = s.query(func.sum(CashTx.amount)).filter_by(user_id=u.id, type='WITHDRAW').scalar() or 0
         net = fees + payouts + withdraws
-        await q.edit_message_text(f"📊 Stats\nFees: ${abs(fees):.2f}\nPayouts: ${payouts:.2f}\nWithdraws: ${withdraws:.2f}\nNet: ${net:.2f}", reply_markup=back_button())
+        await q.edit_message_text(f"📊 Stats\nFees: ${abs(fees):.2f}\nPayouts: ${payouts:.2f}\nWithdraws: ${withdraws:.2f}\nNet: ${net:.2f}", reply_markup=back_tools())
     elif d == "profit_history":
         txs = s.query(CashTx).filter_by(user_id=u.id).order_by(CashTx.date.desc()).limit(20).all()
         msg = "📜 Bank History\n\n"
         for t in txs:
             msg += f"{t.date.strftime('%d/%m/%Y')} {t.type} ${t.amount:+.2f} - {t.note}\n"
-        await q.edit_message_text(msg or "No transactions", reply_markup=back_button())
+        await q.edit_message_text(msg or "No transactions", reply_markup=back_tools())
     elif d == "profit_reset":
         await q.edit_message_text("Delete ALL data?", reply_markup=InlineKeyboardMarkup([
-            [InlineKeyboardButton("✅ YES", callback_data="reset_yes"), InlineKeyboardButton("❌ No", callback_data="back_main")]
+            [InlineKeyboardButton("✅ YES", callback_data="reset_yes"), InlineKeyboardButton("❌ No", callback_data="menu_profit")]
         ]))
     elif d == "profit_edit":
         accs = s.query(Account).filter_by(user_id=u.id).all()
         kb = [[InlineKeyboardButton(f"🗑 {a.name}", callback_data=f"delacc_{a.id}")] for a in accs]
-        kb.append([InlineKeyboardButton("⬅ Back", callback_data="back_main")])
+        kb.append([InlineKeyboardButton("⬅ Back", callback_data="menu_profit")])
         await q.edit_message_text("Delete account:", reply_markup=InlineKeyboardMarkup(kb))
     s.close()
 
