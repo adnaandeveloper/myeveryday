@@ -29,7 +29,7 @@ class Account(Base):
     start_balance = Column(Float)
     current_balance = Column(Float)
     fee_paid = Column(Float, default=0)
-    payout_cut = Column(Float, default=20) # NEW: prop firm %
+    payout_cut = Column(Float, default=20)
     status = Column(String, default='ACTIVE')
     __table_args__ = (UniqueConstraint('user_id', 'name'),)
 
@@ -159,6 +159,13 @@ async def payout_select(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     ctx.user_data['mode'] = 'payout'
     ctx.user_data['payout_acc'] = q.data[7:]
     await q.edit_message_text("Gross payout amount?", reply_markup=back_button())
+
+async def deposit_select(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    await q.answer()
+    ctx.user_data['mode'] = 'deposit'
+    ctx.user_data['deposit_acc'] = q.data[8:]
+    await q.edit_message_text("How much to deposit?", reply_markup=back_button())
 
 async def menu_cb(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
@@ -308,9 +315,10 @@ async def profit_cb(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         ctx.user_data['qt'] = 'challenge'
         await q.edit_message_text("Send: NAME BALANCE FEE", reply_markup=back_button())
     elif d == "profit_deposit":
-        ctx.user_data['mode'] = 'quick'
-        ctx.user_data['qt'] = 'deposit'
-        await q.edit_message_text("Send: NAME AMOUNT", reply_markup=back_button())
+        accs = s.query(Account).filter_by(user_id=u.id, status='ACTIVE', type='LIVE').all()
+        kb = [[InlineKeyboardButton(a.name, callback_data=f"deposit_{a.id}")] for a in accs]
+        kb.append([InlineKeyboardButton("⬅ Back", callback_data="back_main")])
+        await q.edit_message_text("Deposit to which LIVE account?", reply_markup=InlineKeyboardMarkup(kb))
     elif d == "profit_payout":
         accs = s.query(Account).filter_by(user_id=u.id, status='ACTIVE').all()
         kb = [[InlineKeyboardButton(f"{a.name} ({a.type})", callback_data=f"payout_{a.id}")] for a in accs]
@@ -530,6 +538,14 @@ async def text_handler(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         s.commit()
         ctx.user_data.clear()
         await update.message.reply_text(f"✅ Payout: ${gross} → Bank +${net:.2f} ({cut}% fee)", reply_markup=main_menu(update.effective_user.id))
+    elif mode == 'deposit':
+        amt = float(txt)
+        acc = s.query(Account).get(ctx.user_data['deposit_acc'])
+        acc.current_balance += amt
+        s.add(CashTx(user_id=u.id, type='DEPOSIT', amount=-amt, note=f"Fund {acc.name}"))
+        s.commit()
+        ctx.user_data.clear()
+        await update.message.reply_text(f"✅ Deposited ${amt} to {acc.name} (Bank -${amt})", reply_markup=main_menu(update.effective_user.id))
     elif mode == 'quick':
         qt = ctx.user_data['qt']
         if qt == 'challenge':
@@ -539,13 +555,6 @@ async def text_handler(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             s.add(CashTx(user_id=u.id, type='FEE', amount=-float(fee), note=f"Buy {name}"))
             s.commit()
             await update.message.reply_text(f"✅ {name} added", reply_markup=main_menu(update.effective_user.id))
-        elif qt == 'deposit':
-            name, amt = txt.split()
-            acc = s.query(Account).filter_by(user_id=u.id, name=name).first()
-            acc.current_balance += float(amt)
-            s.add(CashTx(user_id=u.id, type='DEPOSIT', amount=-float(amt), note=f"Fund {name}"))
-            s.commit()
-            await update.message.reply_text("✅ Funded", reply_markup=main_menu(update.effective_user.id))
         ctx.user_data.clear()
     elif mode == 'pair_add':
         sym = txt.upper().replace("/", "")
@@ -617,6 +626,7 @@ def main():
     app.add_handler(CallbackQueryHandler(archive_acc, pattern="^arch_"))
     app.add_handler(CallbackQueryHandler(wd_select, pattern="^wd_"))
     app.add_handler(CallbackQueryHandler(payout_select, pattern="^payout_"))
+    app.add_handler(CallbackQueryHandler(deposit_select, pattern="^deposit_"))
     app.add_handler(CallbackQueryHandler(reset_yes, pattern="^reset_yes$"))
     app.add_handler(CallbackQueryHandler(trade_acc_cb, pattern="^ta_"))
     app.add_handler(CallbackQueryHandler(trade_pair_cb, pattern="^tp_"))
