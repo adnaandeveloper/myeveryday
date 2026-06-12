@@ -4,12 +4,13 @@ load_dotenv()
 
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import Application, CommandHandler, ContextTypes, CallbackQueryHandler, MessageHandler, filters
-from sqlalchemy import create_engine, Column, String, Float, DateTime, ForeignKey, Text, UniqueConstraint, func
+from sqlalchemy import create_engine, Column, String, Float, DateTime, ForeignKey, Text, UniqueConstraint, func, extract
 from sqlalchemy.orm import declarative_base, sessionmaker
 from datetime import datetime
 import uuid
+import calendar
 
-# ==================== DATABASE ====================
+# ==================== DATABASE MODELS ====================
 Base = declarative_base()
 def uid(): return str(uuid.uuid4())
 
@@ -72,6 +73,7 @@ class CashTx(Base):
     note = Column(Text)
     date = Column(DateTime, default=datetime.utcnow)
 
+# ==================== SETUP ====================
 DATABASE_URL = os.getenv("DATABASE_URL", "sqlite:///./edgeflo.db")
 ADMIN_IDS = os.getenv("ADMIN_IDS", "").split(",")
 engine = create_engine(DATABASE_URL, future=True)
@@ -264,14 +266,21 @@ async def menu_cb(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         await q.edit_message_text(msg, reply_markup=back_button())
         return
     if d == "menu_journal":
-        trades = s.query(Trade).filter_by(user_id=u.id).order_by(Trade.opened_at.desc()).limit(5).all()
-        msg = "📖 Last Trades\n"
-        for t in trades:
-            msg += f"{t.opened_at.strftime('%d/%m/%Y')} {t.symbol} {t.direction}\n"
-        kb = [[InlineKeyboardButton(f"View {t.symbol}", callback_data=f"view_{t.id}")] for t in trades]
-        kb.append([InlineKeyboardButton("⬅ Back", callback_data="back_main")])
+        trades = s.query(Trade).filter_by(user_id=u.id).order_by(Trade.opened_at.desc()).all()
         s.close()
-        await q.edit_message_text(msg, reply_markup=InlineKeyboardMarkup(kb))
+        months = {}
+        for t in trades:
+            key = (t.opened_at.year, t.opened_at.month)
+            months[key] = months.get(key, 0) + 1
+        if not months:
+            await q.edit_message_text("📖 No trades yet", reply_markup=back_button())
+            return
+        kb = []
+        for (year, month), count in sorted(months.items(), reverse=True):
+            month_name = calendar.month_name[month]
+            kb.append([InlineKeyboardButton(f"{month_name} {year} ({count} trades)", callback_data=f"journal_{year}_{month}")])
+        kb.append([InlineKeyboardButton("⬅ Back", callback_data="back_main")])
+        await q.edit_message_text("📖 Journal - Select Month", reply_markup=InlineKeyboardMarkup(kb))
         return
     if d == "menu_hist":
         tas = s.query(TradeAccount).join(Trade).filter(Trade.user_id == u.id).order_by(TradeAccount.closed_at.desc()).limit(15).all()
@@ -520,6 +529,57 @@ async def close_acc_back(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     ctx.user_data['mode'] = 'close'
     await show_close_accounts_menu(q, ctx)
 
+async def journal_month_cb(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    await q.answer()
+    _, year, month = q.data.split('_')
+    year, month = int(year), int(month)
+    s = Session()
+    u = get_user(q.from_user.id)
+    trades = s.query(Trade).filter_by(user_id=u.id).filter(extract('year', Trade.opened_at) == year).filter(extract('month', Trade.opened_at) == month).order_by(Trade.opened_at.desc()).all()
+    s.close()
+    kb = []
+    for t in trades:
+        date_str = t.opened_at.strftime('%d %b')
+        status = "✅" if t.closed_at else "🟢"
+        kb.append([InlineKeyboardButton(f"{date_str} {t.symbol} {t.direction} {status}", callback_data=f"view_{t.id}")])
+    kb.append([InlineKeyboardButton("⬅ Back to Months", callback_data="menu_journal")])
+    month_name = calendar.month_name[month]
+    await q.edit_message_text(f"📖 {month_name} {year} - {len(trades)} trades", reply_markup=InlineKeyboardMarkup(kb))
+
+async def view_trade_cb(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    await q.answer()
+    tid = q.data[5:]
+    s = Session()
+    tr = s.query(Trade).get(tid)
+    if not tr:
+        s.close()
+        await q.edit_message_text("Trade not found", reply_markup=back_button())
+        return
+    msg = f"📊 {tr.symbol} {tr.direction}\n📅 Opened: {tr.opened_at.strftime('%d %b %Y %H:%M')}\n"
+    if tr.closed_at:
+        msg += f"🔒 Closed: {tr.closed_at.strftime('%d %b %Y %H:%M')}\n"
+    tas = s.query(TradeAccount).filter_by(trade_id=tid).all()
+    if tas:
+        total_pnl = sum(ta.pnl_usd or 0 for ta in tas)
+        msg += f"\n💰 Total PnL: ${total_pnl:+.2f}\n\nPer Account:\n"
+        for ta in tas:
+            acc = s.query(Account).get(ta.account_id)
+            if ta.pnl_usd is not None:
+                msg += f"• {acc.name}: ${ta.pnl_usd:+.2f} ({ta.result})\n"
+            else:
+                msg += f"• {acc.name}: Open\n"
+    year = tr.opened_at.year
+    month = tr.opened_at.month
+    kb = [[InlineKeyboardButton("⬅ Back to Month", callback_data=f"journal_{year}_{month}")]]
+    await q.edit_message_text(msg, reply_markup=InlineKeyboardMarkup(kb))
+    if tr.before_photo:
+        await q.message.reply_photo(tr.before_photo, caption="📸 BEFORE")
+    if tr.after_photo:
+        await q.message.reply_photo(tr.after_photo, caption="📸 AFTER")
+    s.close()
+
 async def admin_cb(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
     await q.answer()
@@ -555,30 +615,6 @@ async def delacc_cb(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     s.commit()
     s.close()
     await q.edit_message_text("✅ Account deleted", reply_markup=back_button())
-
-async def view_trade_cb(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    q = update.callback_query
-    await q.answer()
-    tid = q.data[5:]
-    s = Session()
-    tr = s.query(Trade).get(tid)
-    if not tr:
-        s.close()
-        await q.edit_message_text("Trade not found", reply_markup=back_button())
-        return
-    msg = f"📖 {tr.symbol} {tr.direction}\nOpened: {tr.opened_at.strftime('%d/%m/%Y %H:%M')}"
-    if tr.closed_at:
-        msg += f"\nClosed: {tr.closed_at.strftime('%d/%m/%Y %H:%M')}"
-    tas = s.query(TradeAccount).filter_by(trade_id=tid).all()
-    if tas and any(t.pnl_usd for t in tas):
-        pnl = sum(t.pnl_usd or 0 for t in tas)
-        msg += f"\nPnL: ${pnl:+.2f}"
-    await q.edit_message_text(msg, reply_markup=back_button())
-    if tr.before_photo:
-        await q.message.reply_photo(tr.before_photo, caption="Before")
-    if tr.after_photo:
-        await q.message.reply_photo(tr.after_photo, caption="After")
-    s.close()
 
 async def text_handler(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     mode = ctx.user_data.get('mode')
@@ -701,10 +737,11 @@ def main():
     app.add_handler(CallbackQueryHandler(close_res_cb, pattern="^res_"))
     app.add_handler(CallbackQueryHandler(close_acc_select, pattern="^closeacc_"))
     app.add_handler(CallbackQueryHandler(close_acc_back, pattern="^closeacc_back$"))
+    app.add_handler(CallbackQueryHandler(journal_month_cb, pattern="^journal_"))
+    app.add_handler(CallbackQueryHandler(view_trade_cb, pattern="^view_"))
     app.add_handler(CallbackQueryHandler(admin_cb, pattern="^admin_"))
     app.add_handler(CallbackQueryHandler(pair_cb, pattern="^pair"))
     app.add_handler(CallbackQueryHandler(delacc_cb, pattern="^delacc_"))
-    app.add_handler(CallbackQueryHandler(view_trade_cb, pattern="^view_"))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, text_handler))
     app.add_handler(MessageHandler(filters.PHOTO, photo_handler))
     app.run_polling()
