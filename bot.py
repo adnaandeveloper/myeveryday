@@ -9,6 +9,7 @@ from sqlalchemy.orm import declarative_base, sessionmaker
 from datetime import datetime
 import uuid
 
+# ==================== DATABASE MODELS ====================
 Base = declarative_base()
 def uid(): return str(uuid.uuid4())
 
@@ -65,11 +66,12 @@ class CashTx(Base):
     __tablename__ = 'cash_txs'
     id = Column(String, primary_key=True, default=uid)
     user_id = Column(String, ForeignKey('users.id'))
-    type = Column(String)
+    type = Column(String) # FEE, PAYOUT, WITHDRAW, DEPOSIT, ADJUST
     amount = Column(Float)
     note = Column(Text)
     date = Column(DateTime, default=datetime.utcnow)
 
+# ==================== SETUP ====================
 DATABASE_URL = os.getenv("DATABASE_URL", "sqlite:///./edgeflo.db")
 ADMIN_IDS = os.getenv("ADMIN_IDS", "").split(",")
 engine = create_engine(DATABASE_URL, future=True)
@@ -118,6 +120,7 @@ def profit_menu():
         [InlineKeyboardButton("⬅ Back", callback_data="back_main")]
     ])
 
+# ==================== BASIC COMMANDS ====================
 async def start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     get_user(update.effective_user.id)
     ctx.user_data.clear()
@@ -132,6 +135,7 @@ async def back_main(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     ctx.user_data.clear()
     await q.edit_message_text("📊 Trading Journal", reply_markup=main_menu(q.from_user.id))
 
+# ==================== ACCOUNT MANAGEMENT ====================
 async def archive_acc(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
     await q.answer()
@@ -150,6 +154,7 @@ async def wd_select(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     ctx.user_data['wd_acc'] = q.data[3:]
     await q.edit_message_text("Amount to withdraw to bank?", reply_markup=back_button())
 
+# ==================== MENU HANDLER ====================
 async def menu_cb(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
     await q.answer()
@@ -204,6 +209,8 @@ async def menu_cb(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         s.close()
         await q.edit_message_text(msg, reply_markup=InlineKeyboardMarkup(kb))
         return
+
+    # ===== NEW: ADD ACCOUNT WITH BUTTONS =====
     if d == "menu_add":
         s.close()
         await q.edit_message_text("Choose account type:", reply_markup=InlineKeyboardMarkup([
@@ -225,6 +232,7 @@ async def menu_cb(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         s.close()
         await q.edit_message_text("Challenge name? (e.g. FTMO 100k)", reply_markup=back_button())
         return
+
     if d == "menu_profit":
         s.close()
         await q.edit_message_text("💰 Wallet & Tools", reply_markup=profit_menu())
@@ -282,6 +290,7 @@ async def menu_cb(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         return
     s.close()
 
+# ==================== WALLET & TOOLS ====================
 async def profit_cb(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
     await q.answer()
@@ -344,6 +353,7 @@ async def reset_yes(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     s.close()
     await q.edit_message_text("✅ Reset done", reply_markup=back_button())
 
+# ==================== TRADE LOGGING (SIMPLIFIED) ====================
 async def trade_start(q, ctx):
     s = Session()
     u = get_user(q.from_user.id)
@@ -412,6 +422,7 @@ async def close_res_cb(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     ctx.user_data['close']['step'] = 'pnl'
     await q.edit_message_text(f"{res} hit. How much?", reply_markup=back_button())
 
+# ==================== ADMIN & PAIRS ====================
 async def admin_cb(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
     await q.answer()
@@ -450,6 +461,8 @@ async def delacc_cb(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     s.close()
     await q.edit_message_text("✅ Account deleted", reply_markup=back_button())
 
+# ==================== TEXT HANDLER ====================
+
 async def text_handler(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     mode = ctx.user_data.get('mode')
     txt = update.message.text.strip()
@@ -472,23 +485,29 @@ async def text_handler(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             if atype == 'CHALLENGE':
                 ctx.user_data['step'] = 3
                 await update.message.reply_text("Fee paid? (will be deducted from Bank)", reply_markup=back_button())
-            else: # LIVE
+            else:  # LIVE
                 bal = ctx.user_data['na_bal']
-                acc = Account(user_id=u.id, name=ctx.user_data['na_name'], type='LIVE', start_balance=bal, current_balance=bal, fee_paid=0)
+                acc = Account(user_id=u.id, name=ctx.user_data['na_name'], type='LIVE', 
+                             start_balance=bal, current_balance=bal, fee_paid=0)
                 s.add(acc)
-                s.add(CashTx(user_id=u.id, type='DEPOSIT', amount=-bal, note=f"Fund {ctx.user_data['na_name']}"))
+                s.add(CashTx(user_id=u.id, type='DEPOSIT', amount=-bal, 
+                            note=f"Fund {ctx.user_data['na_name']}"))
                 s.commit()
                 ctx.user_data.clear()
-                await update.message.reply_text(f"✅ {acc.name} LIVE created (Bank -${bal})", reply_markup=main_menu(update.effective_user.id))
-        elif step == 3: # CHALLENGE fee
+                await update.message.reply_text(f"✅ {acc.name} LIVE created (Bank -${bal})", 
+                                               reply_markup=main_menu(update.effective_user.id))
+        elif step == 3:  # CHALLENGE fee
             fee = float(txt)
             bal = ctx.user_data['na_bal']
-            acc = Account(user_id=u.id, name=ctx.user_data['na_name'], type='CHALLENGE', start_balance=bal, current_balance=bal, fee_paid=fee)
+            acc = Account(user_id=u.id, name=ctx.user_data['na_name'], type='CHALLENGE', 
+                         start_balance=bal, current_balance=bal, fee_paid=fee)
             s.add(acc)
-            s.add(CashTx(user_id=u.id, type='FEE', amount=-fee, note=f"Buy {ctx.user_data['na_name']}"))
+            s.add(CashTx(user_id=u.id, type='FEE', amount=-fee, 
+                        note=f"Buy {ctx.user_data['na_name']}"))
             s.commit()
             ctx.user_data.clear()
-            await update.message.reply_text(f"✅ {acc.name} CHALLENGE created (fee ${fee} taken from Bank)", reply_markup=main_menu(update.effective_user.id))
+            await update.message.reply_text(f"✅ {acc.name} CHALLENGE created (fee ${fee} taken from Bank)", 
+                                           reply_markup=main_menu(update.effective_user.id))
 
     elif mode == 'withdraw':
         amt = float(txt)
@@ -559,8 +578,10 @@ async def text_handler(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             s.commit()
             ctx.user_data.clear()
             await update.message.reply_text(f"✅ Closed {res} ${pnl:+.2f}", reply_markup=main_menu(update.effective_user.id))
+    
     s.close()
 
+# ==================== PHOTO HANDLER ====================
 async def photo_handler(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     mode = ctx.user_data.get('mode')
     s = Session()
@@ -586,6 +607,7 @@ async def photo_handler(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         ]))
     s.close()
 
+# ==================== MAIN ====================
 def main():
     app = Application.builder().token(os.getenv("TELEGRAM_BOT_TOKEN")).build()
     app.add_handler(CommandHandler("start", start))
