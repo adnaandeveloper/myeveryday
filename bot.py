@@ -127,7 +127,7 @@ def profit_menu():
 async def start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     get_user(update.effective_user.id)
     ctx.user_data.clear()
-    await update.message.reply_text("🌟  System for Success", reply_markup=main_menu(update.effective_user.id))
+    await update.message.reply_text("📊 Trading Journal", reply_markup=main_menu(update.effective_user.id))
 
 async def clear_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("🧹 Tap my name → Clear History to clean chat.")
@@ -136,7 +136,7 @@ async def back_main(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
     await q.answer()
     ctx.user_data.clear()
-    await q.edit_message_text("🌟  System for Success", reply_markup=main_menu(q.from_user.id))
+    await q.edit_message_text("📊 Trading Journal", reply_markup=main_menu(q.from_user.id))
 
 async def archive_acc(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
@@ -330,10 +330,11 @@ async def profit_cb(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         await q.edit_message_text("Payout from which account?", reply_markup=InlineKeyboardMarkup(kb))
     elif d == "profit_stats":
         fees = s.query(func.sum(CashTx.amount)).filter_by(user_id=u.id, type='FEE').scalar() or 0
+        deposits = s.query(func.sum(CashTx.amount)).filter_by(user_id=u.id, type='DEPOSIT').scalar() or 0
         payouts = s.query(func.sum(CashTx.amount)).filter_by(user_id=u.id, type='PAYOUT').scalar() or 0
         withdraws = s.query(func.sum(CashTx.amount)).filter_by(user_id=u.id, type='WITHDRAW').scalar() or 0
-        net = fees + payouts + withdraws
-        await q.edit_message_text(f"📊 Stats\nFees: ${abs(fees):.2f}\nPayouts: ${payouts:.2f}\nWithdraws: ${withdraws:.2f}\nNet: ${net:.2f}", reply_markup=back_tools())
+        net = fees + payouts + withdraws + deposits
+        await q.edit_message_text(f"📊 Stats\nFees: ${abs(fees):.2f}\nLive Capital: ${abs(deposits):.2f}\nPayouts: ${payouts:.2f}\nWithdraws: ${abs(withdraws):.2f}\nNet: ${net:.2f}", reply_markup=back_tools())
     elif d == "profit_history":
         txs = s.query(CashTx).filter_by(user_id=u.id).order_by(CashTx.date.desc()).limit(20).all()
         msg = "📜 Bank History\n\n"
@@ -489,6 +490,30 @@ async def delacc_cb(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     s.close()
     await q.edit_message_text("✅ Account deleted", reply_markup=back_button())
 
+async def view_trade_cb(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    await q.answer()
+    tid = q.data[5:]
+    s = Session()
+    tr = s.query(Trade).get(tid)
+    if not tr:
+        s.close()
+        await q.edit_message_text("Trade not found", reply_markup=back_button())
+        return
+    msg = f"📖 {tr.symbol} {tr.direction}\nOpened: {tr.opened_at.strftime('%d/%m/%Y %H:%M')}"
+    if tr.closed_at:
+        msg += f"\nClosed: {tr.closed_at.strftime('%d/%m/%Y %H:%M')}"
+    tas = s.query(TradeAccount).filter_by(trade_id=tid).all()
+    if tas and any(t.pnl_usd for t in tas):
+        pnl = sum(t.pnl_usd or 0 for t in tas)
+        msg += f"\nPnL: ${pnl:+.2f}"
+    await q.edit_message_text(msg, reply_markup=back_button())
+    if tr.before_photo:
+        await q.message.reply_photo(tr.before_photo, caption="Before")
+    if tr.after_photo:
+        await q.message.reply_photo(tr.after_photo, caption="After")
+    s.close()
+
 async def text_handler(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     mode = ctx.user_data.get('mode')
     txt = update.message.text.strip()
@@ -641,6 +666,7 @@ def main():
     app.add_handler(CallbackQueryHandler(admin_cb, pattern="^admin_"))
     app.add_handler(CallbackQueryHandler(pair_cb, pattern="^pair"))
     app.add_handler(CallbackQueryHandler(delacc_cb, pattern="^delacc_"))
+    app.add_handler(CallbackQueryHandler(view_trade_cb, pattern="^view_"))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, text_handler))
     app.add_handler(MessageHandler(filters.PHOTO, photo_handler))
     app.run_polling()
