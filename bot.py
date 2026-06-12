@@ -9,7 +9,7 @@ from sqlalchemy.orm import declarative_base, sessionmaker
 from datetime import datetime
 import uuid
 
-# ==================== DATABASE MODELS ====================
+# ==================== DATABASE ====================
 Base = declarative_base()
 def uid(): return str(uuid.uuid4())
 
@@ -72,7 +72,6 @@ class CashTx(Base):
     note = Column(Text)
     date = Column(DateTime, default=datetime.utcnow)
 
-# ==================== SETUP ====================
 DATABASE_URL = os.getenv("DATABASE_URL", "sqlite:///./edgeflo.db")
 ADMIN_IDS = os.getenv("ADMIN_IDS", "").split(",")
 engine = create_engine(DATABASE_URL, future=True)
@@ -435,17 +434,25 @@ async def close_cb(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 async def close_res_cb(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
     await q.answer()
-    res = q.data.split('_')[1]
-    ctx.user_data['close']['result'] = res
-    tid = ctx.user_data['close']['id']
-    s = Session()
-    tas = s.query(TradeAccount).filter_by(trade_id=tid).all()
-    s.close()
-    if not tas:
-        await q.edit_message_text("❌ No accounts linked to this trade (it was logged before the update). Log a new trade with 'All Accounts'.", reply_markup=back_button())
-        return
-    ctx.user_data['close']['tas'] = {ta.account_id: ta.pnl_usd for ta in tas}
-    await show_close_accounts_menu(q, ctx)
+    try:
+        res = q.data.split('_')[1]
+        if 'close' not in ctx.user_data:
+            ctx.user_data['close'] = {}
+        ctx.user_data['close']['result'] = res
+        if 'id' not in ctx.user_data['close']:
+            await q.edit_message_text("⚠️ Session expired. Please select Close Trade again.", reply_markup=back_button())
+            return
+        tid = ctx.user_data['close']['id']
+        s = Session()
+        tas = s.query(TradeAccount).filter_by(trade_id=tid).all()
+        s.close()
+        if not tas:
+            await q.edit_message_text("❌ No accounts linked.", reply_markup=back_button())
+            return
+        ctx.user_data['close']['tas'] = {ta.account_id: ta.pnl_usd for ta in tas}
+        await show_close_accounts_menu(q, ctx)
+    except Exception as e:
+        await q.edit_message_text(f"Error: {e}", reply_markup=back_button())
 
 async def show_close_accounts_menu(q_or_update, ctx):
     tid = ctx.user_data['close']['id']
@@ -454,21 +461,24 @@ async def show_close_accounts_menu(q_or_update, ctx):
     s = Session()
     kb = []
     all_done = True
-    for acc_id, pnl in acc_pnls.items():
+    ctx.user_data['close']['map'] = {}
+    for i, (acc_id, pnl) in enumerate(acc_pnls.items()):
         acc = s.query(Account).get(acc_id)
         if not acc:
             continue
+        code = f"c{i}"
+        ctx.user_data['close']['map'][code] = acc_id
         if pnl is None:
-            kb.append([InlineKeyboardButton(f"[ ] {acc.name}", callback_data=f"closeacc_{tid}_{acc_id}")])
+            kb.append([InlineKeyboardButton(f"[ ] {acc.name}", callback_data=f"closeacc_{code}")])
             all_done = False
         else:
-            kb.append([InlineKeyboardButton(f"[✅ ${pnl:+.0f}] {acc.name}", callback_data=f"closeacc_{tid}_{acc_id}")])
+            kb.append([InlineKeyboardButton(f"[✅ ${pnl:+.0f}] {acc.name}", callback_data=f"closeacc_{code}")])
     if all_done:
         kb.append([InlineKeyboardButton("✅ DONE - Close Trade", callback_data="closeacc_done")])
     else:
         kb.append([InlineKeyboardButton("⬅ Back", callback_data="back_main")])
     s.close()
-    text = f"{res} hit. Tap each account to enter PnL:"
+    text = f"{res} hit. Tap each account:"
     if isinstance(q_or_update, Update):
         await q_or_update.message.reply_text(text, reply_markup=InlineKeyboardMarkup(kb))
     else:
@@ -477,8 +487,8 @@ async def show_close_accounts_menu(q_or_update, ctx):
 async def close_acc_select(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
     await q.answer()
-    data = q.data.split('_')
-    if data[1] == "done":
+    data = q.data
+    if data == "closeacc_done":
         tid = ctx.user_data['close']['id']
         s = Session()
         tr = s.query(Trade).get(tid)
@@ -495,13 +505,14 @@ async def close_acc_select(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         ctx.user_data.clear()
         await q.edit_message_text("✅ Trade closed. All accounts updated.", reply_markup=main_menu(q.from_user.id))
         return
-    tid, acc_id = data[1], data[2]
+    code = data.split('_')[1]
+    acc_id = ctx.user_data['close']['map'][code]
     ctx.user_data['mode'] = 'close_pnl'
     ctx.user_data['close']['current_acc'] = acc_id
     s = Session()
     acc = s.query(Account).get(acc_id)
     s.close()
-    await q.edit_message_text(f"Enter PnL for {acc.name}:\nCurrent balance: ${acc.current_balance:.2f}\n\nSend dollar amount. Use - for loss, + for profit.", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("⬅ Back to list", callback_data="closeacc_back")]]))
+    await q.edit_message_text(f"Enter PnL for {acc.name}:\nCurrent: ${acc.current_balance:.2f}", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("⬅ Back", callback_data="closeacc_back")]]))
 
 async def close_acc_back(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
@@ -518,8 +529,6 @@ async def admin_cb(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         msg = f"👥 Users ({len(users)})\n\n"
         for u in users:
             msg += f"• {u.telegram_id} {'(admin)' if u.is_admin=='1' else ''}\n"
-        if len(users) == 1:
-            msg += "\nYou are the only user"
         s.close()
         await q.edit_message_text(msg, reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("⬅ Back", callback_data="menu_admin")]]))
 
@@ -582,27 +591,23 @@ async def text_handler(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         if step == 1:
             ctx.user_data['na_name'] = txt
             ctx.user_data['step'] = 2
-            if atype == 'CHALLENGE':
-                await update.message.reply_text("Account size? (e.g. 100000)", reply_markup=back_button())
-            else:
-                await update.message.reply_text("Starting balance?", reply_markup=back_button())
+            await update.message.reply_text("Account size?" if atype == 'CHALLENGE' else "Starting balance?", reply_markup=back_button())
         elif step == 2:
             ctx.user_data['na_bal'] = float(txt)
             if atype == 'CHALLENGE':
                 ctx.user_data['step'] = 3
-                await update.message.reply_text("Fee paid? (will be deducted from Bank)", reply_markup=back_button())
+                await update.message.reply_text("Fee paid?", reply_markup=back_button())
             else:
                 bal = ctx.user_data['na_bal']
-                acc = Account(user_id=u.id, name=ctx.user_data['na_name'], type='LIVE', start_balance=bal, current_balance=bal, fee_paid=0)
+                acc = Account(user_id=u.id, name=ctx.user_data['na_name'], type='LIVE', start_balance=bal, current_balance=bal)
                 s.add(acc)
-                s.add(CashTx(user_id=u.id, type='DEPOSIT', amount=-bal, note=f"Fund {ctx.user_data['na_name']}"))
+                s.add(CashTx(user_id=u.id, type='DEPOSIT', amount=-bal, note=f"Fund {acc.name}"))
                 s.commit()
                 ctx.user_data.clear()
-                await update.message.reply_text(f"✅ {acc.name} LIVE created (Bank -${bal})", reply_markup=main_menu(update.effective_user.id))
+                await update.message.reply_text(f"✅ {acc.name} LIVE created", reply_markup=main_menu(update.effective_user.id))
         elif step == 3:
             ctx.user_data['na_fee'] = float(txt)
-            ctx.user_data['step'] = 4
-            await update.message.reply_text("Prop firm keeps what %?", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("10%", callback_data="cut_10"), InlineKeyboardButton("15%", callback_data="cut_15")], [InlineKeyboardButton("20%", callback_data="cut_20"), InlineKeyboardButton("25%", callback_data="cut_25")]]))
+            await update.message.reply_text("Prop cut %?", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("10%", callback_data="cut_10"), InlineKeyboardButton("20%", callback_data="cut_20")]]))
     elif mode == 'withdraw':
         amt = float(txt)
         acc = s.query(Account).get(ctx.user_data['wd_acc'])
@@ -610,17 +615,17 @@ async def text_handler(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         s.add(CashTx(user_id=u.id, type='WITHDRAW', amount=amt, note=f"From {acc.name}"))
         s.commit()
         ctx.user_data.clear()
-        await update.message.reply_text(f"✅ Withdrew ${amt} from {acc.name} to bank", reply_markup=main_menu(update.effective_user.id))
+        await update.message.reply_text(f"✅ Withdrew ${amt}", reply_markup=main_menu(update.effective_user.id))
     elif mode == 'payout':
         gross = float(txt)
         acc = s.query(Account).get(ctx.user_data['payout_acc'])
         cut = acc.payout_cut if acc.type == 'CHALLENGE' else 0
         net = gross * (1 - cut / 100)
         acc.current_balance -= gross
-        s.add(CashTx(user_id=u.id, type='PAYOUT', amount=net, note=f"{acc.name} gross ${gross} -{cut}%"))
+        s.add(CashTx(user_id=u.id, type='PAYOUT', amount=net, note=f"{acc.name}"))
         s.commit()
         ctx.user_data.clear()
-        await update.message.reply_text(f"✅ Payout: ${gross} → Bank +${net:.2f} ({cut}% fee)", reply_markup=main_menu(update.effective_user.id))
+        await update.message.reply_text(f"✅ Payout ${net:.2f}", reply_markup=main_menu(update.effective_user.id))
     elif mode == 'deposit':
         amt = float(txt)
         acc = s.query(Account).get(ctx.user_data['deposit_acc'])
@@ -628,40 +633,26 @@ async def text_handler(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         s.add(CashTx(user_id=u.id, type='DEPOSIT', amount=-amt, note=f"Fund {acc.name}"))
         s.commit()
         ctx.user_data.clear()
-        await update.message.reply_text(f"✅ Deposited ${amt} to {acc.name} (Bank -${amt})", reply_markup=main_menu(update.effective_user.id))
-    elif mode == 'quick':
-        qt = ctx.user_data['qt']
-        if qt == 'challenge':
-            name, bal, fee = txt.split()
-            acc = Account(user_id=u.id, name=name, type='CHALLENGE', start_balance=float(bal), current_balance=float(bal), fee_paid=float(fee))
-            s.add(acc)
-            s.add(CashTx(user_id=u.id, type='FEE', amount=-float(fee), note=f"Buy {name}"))
-            s.commit()
-            await update.message.reply_text(f"✅ {name} added", reply_markup=main_menu(update.effective_user.id))
-        ctx.user_data.clear()
+        await update.message.reply_text(f"✅ Deposited ${amt}", reply_markup=main_menu(update.effective_user.id))
     elif mode == 'pair_add':
         sym = txt.upper().replace("/", "")
         s.add(Pair(user_id=u.id, symbol=sym))
         s.commit()
         ctx.user_data.clear()
-        await update.message.reply_text(f"✅ Pair added: {sym}", reply_markup=main_menu(update.effective_user.id))
+        await update.message.reply_text(f"✅ Pair {sym}", reply_markup=main_menu(update.effective_user.id))
     elif mode == 'bal_edit':
         new_amt = float(txt)
         current = sum(t.amount for t in s.query(CashTx).filter_by(user_id=u.id)) or 0
-        diff = new_amt - current
-        s.add(CashTx(user_id=u.id, type='ADJUST', amount=diff, note='Manual edit'))
+        s.add(CashTx(user_id=u.id, type='ADJUST', amount=new_amt-current, note='Manual'))
         s.commit()
         ctx.user_data.clear()
-        await update.message.reply_text(f"✅ Bank set to ${new_amt:.2f}", reply_markup=main_menu(update.effective_user.id))
+        await update.message.reply_text(f"✅ Bank ${new_amt:.2f}", reply_markup=main_menu(update.effective_user.id))
     elif mode == 'close_pnl':
-        try:
-            pnl = float(txt)
-            acc_id = ctx.user_data['close']['current_acc']
-            ctx.user_data['close']['tas'][acc_id] = pnl
-            ctx.user_data['mode'] = 'close'
-            await show_close_accounts_menu(update, ctx)
-        except ValueError:
-            await update.message.reply_text("Send a valid number like +400 or -150", reply_markup=back_button())
+        pnl = float(txt)
+        acc_id = ctx.user_data['close']['current_acc']
+        ctx.user_data['close']['tas'][acc_id] = pnl
+        ctx.user_data['mode'] = 'close'
+        await show_close_accounts_menu(update, ctx)
     s.close()
 
 async def photo_handler(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
@@ -677,7 +668,7 @@ async def photo_handler(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             s.add(TradeAccount(trade_id=tr.id, account_id=aid))
         s.commit()
         ctx.user_data.clear()
-        await update.message.reply_text(f"✅ Trade {tr.symbol} {tr.direction} logged", reply_markup=main_menu(update.effective_user.id))
+        await update.message.reply_text(f"✅ Trade logged", reply_markup=main_menu(update.effective_user.id))
     elif mode == 'close' and ctx.user_data.get('close', {}).get('step') == 'photo':
         tid = ctx.user_data['close']['id']
         tr = s.query(Trade).get(tid)
