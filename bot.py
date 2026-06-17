@@ -2,7 +2,7 @@ import os
 from dotenv import load_dotenv
 load_dotenv()
 
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, ReplyKeyboardMarkup, KeyboardButton
 from telegram.ext import Application, CommandHandler, ContextTypes, CallbackQueryHandler, MessageHandler, filters
 from sqlalchemy import create_engine, Column, String, Float, DateTime, ForeignKey, Text, UniqueConstraint, func, extract
 from sqlalchemy.orm import declarative_base, sessionmaker
@@ -97,15 +97,15 @@ def is_admin(tid):
 
 def main_menu(uid=None):
     rows = [
-        [InlineKeyboardButton("📝 Log Trade", callback_data="menu_log"), InlineKeyboardButton("✅ Close Trade", callback_data="menu_close")],
-        [InlineKeyboardButton("💰 Balance", callback_data="menu_balance"), InlineKeyboardButton("⚙ My Accounts", callback_data="menu_accounts")],
-        [InlineKeyboardButton("📊 Analyse", callback_data="menu_analyse"), InlineKeyboardButton("📖 Journal", callback_data="menu_journal")],
-        [InlineKeyboardButton("📈 My Pairs", callback_data="menu_pairs"), InlineKeyboardButton("📜 Trade History", callback_data="menu_hist")],
-        [InlineKeyboardButton("➕ Add Account", callback_data="menu_add"), InlineKeyboardButton("💰 Wallet & Tools", callback_data="menu_profit")],
+        [KeyboardButton("📝 Log Trade"), KeyboardButton("✅ Close Trade")],
+        [KeyboardButton("💰 Balance"), KeyboardButton("⚙ My Accounts")],
+        [KeyboardButton("📊 Analyse"), KeyboardButton("📖 Journal")],
+        [KeyboardButton("📈 My Pairs"), KeyboardButton("📜 Trade History")],
+        [KeyboardButton("➕ Add Account"), KeyboardButton("💰 Wallet & Tools")],
     ]
     if uid and is_admin(uid):
-        rows.append([InlineKeyboardButton("👑 ADMIN PANEL", callback_data="menu_admin")])
-    return InlineKeyboardMarkup(rows)
+        rows.append([KeyboardButton("👑 ADMIN PANEL")])
+    return ReplyKeyboardMarkup(rows, resize_keyboard=True)
 
 def back_button():
     return InlineKeyboardMarkup([[InlineKeyboardButton("⬅ Back to Menu", callback_data="back_main")]])
@@ -126,7 +126,7 @@ def profit_menu():
 async def start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     get_user(update.effective_user.id)
     ctx.user_data.clear()
-    await update.message.reply_text("💰 My Bank", reply_markup=main_menu(update.effective_user.id))
+    await update.message.reply_text("📊 Trading Journal", reply_markup=main_menu(update.effective_user.id))
 
 async def clear_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("🧹 Tap my name → Clear History")
@@ -135,7 +135,11 @@ async def back_main(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
     await q.answer()
     ctx.user_data.clear()
-    await q.edit_message_text("💰 My Bank", reply_markup=main_menu(q.from_user.id))
+    await q.message.reply_text("📊 Trading Journal", reply_markup=main_menu(q.from_user.id))
+    try:
+        await q.message.delete()
+    except:
+        pass
 
 async def archive_acc(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
@@ -301,6 +305,32 @@ async def menu_cb(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         return
     s.close()
 
+async def handle_main_text(update, ctx, data):
+    class FakeQ:
+        def __init__(self, msg, data):
+            self.message = msg
+            self.from_user = msg.from_user
+            self.data = data
+        async def answer(self):
+            pass
+        async def edit_message_text(self, text, reply_markup=None, **kwargs):
+            await self.message.reply_text(text, reply_markup=reply_markup, **kwargs)
+    fake_q = FakeQ(update.message, data)
+    fake_update = type('obj', (object,), {'callback_query': fake_q, 'effective_user': update.effective_user})()
+    await menu_cb(fake_update, ctx)
+
+async def txt_log(update, ctx): await handle_main_text(update, ctx, "menu_log")
+async def txt_close(update, ctx): await handle_main_text(update, ctx, "menu_close")
+async def txt_balance(update, ctx): await handle_main_text(update, ctx, "menu_balance")
+async def txt_accounts(update, ctx): await handle_main_text(update, ctx, "menu_accounts")
+async def txt_analyse(update, ctx): await handle_main_text(update, ctx, "menu_analyse")
+async def txt_journal(update, ctx): await handle_main_text(update, ctx, "menu_journal")
+async def txt_pairs(update, ctx): await handle_main_text(update, ctx, "menu_pairs")
+async def txt_hist(update, ctx): await handle_main_text(update, ctx, "menu_hist")
+async def txt_add(update, ctx): await handle_main_text(update, ctx, "menu_add")
+async def txt_profit(update, ctx): await handle_main_text(update, ctx, "menu_profit")
+async def txt_admin(update, ctx): await handle_main_text(update, ctx, "menu_admin")
+
 async def profit_cb(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
     await q.answer()
@@ -447,7 +477,7 @@ async def close_res_cb(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             ctx.user_data['close'] = {}
         ctx.user_data['close']['result'] = res
         if 'id' not in ctx.user_data['close']:
-            await q.edit_message_text("⚠️ Session expired. Please select Close Trade again.", reply_markup=back_button())
+            await q.edit_message_text("⚠ Session expired. Please select Close Trade again.", reply_markup=back_button())
             return
         tid = ctx.user_data['close']['id']
         s = Session()
@@ -762,6 +792,18 @@ def main():
     app.add_handler(CallbackQueryHandler(admin_cb, pattern="^admin_"))
     app.add_handler(CallbackQueryHandler(pair_cb, pattern="^pair"))
     app.add_handler(CallbackQueryHandler(delacc_cb, pattern="^delacc_"))
+    # Reply keyboard main menu
+    app.add_handler(MessageHandler(filters.Regex("^📝 Log Trade$"), txt_log))
+    app.add_handler(MessageHandler(filters.Regex("^✅ Close Trade$"), txt_close))
+    app.add_handler(MessageHandler(filters.Regex("^💰 Balance$"), txt_balance))
+    app.add_handler(MessageHandler(filters.Regex("^⚙ My Accounts$"), txt_accounts))
+    app.add_handler(MessageHandler(filters.Regex("^📊 Analyse$"), txt_analyse))
+    app.add_handler(MessageHandler(filters.Regex("^📖 Journal$"), txt_journal))
+    app.add_handler(MessageHandler(filters.Regex("^📈 My Pairs$"), txt_pairs))
+    app.add_handler(MessageHandler(filters.Regex("^📜 Trade History$"), txt_hist))
+    app.add_handler(MessageHandler(filters.Regex("^➕ Add Account$"), txt_add))
+    app.add_handler(MessageHandler(filters.Regex("^💰 Wallet & Tools$"), txt_profit))
+    app.add_handler(MessageHandler(filters.Regex("^👑 ADMIN PANEL$"), txt_admin))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, text_handler))
     app.add_handler(MessageHandler(filters.PHOTO, photo_handler))
     app.run_polling()
