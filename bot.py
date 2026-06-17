@@ -832,16 +832,15 @@ async def txt_gallery(update, ctx):
                 await update.message.reply_photo(tr.after_photo, caption="AFTER: " + cap)
         except:
             continue
-
 def main():
     app = Application.builder().token(os.getenv("TELEGRAM_BOT_TOKEN")).build()
+    
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("clear", clear_cmd))
+    
+    # 1. Callbacks first
     app.add_handler(CallbackQueryHandler(back_main, pattern="^back_main$"))
-    app.add_handler(CallbackQueryHandler(menu_cb, pattern="^menu_"))
-    app.add_handler(CallbackQueryHandler(menu_cb, pattern="^bal_"))
-    app.add_handler(CallbackQueryHandler(menu_cb, pattern="^clear_"))
-    app.add_handler(CallbackQueryHandler(menu_cb, pattern="^add_"))
+    app.add_handler(CallbackQueryHandler(menu_cb, pattern="^(menu_|bal_|clear_|add_)"))
     app.add_handler(CallbackQueryHandler(profit_cb, pattern="^profit_"))
     app.add_handler(CallbackQueryHandler(archive_acc, pattern="^arch_"))
     app.add_handler(CallbackQueryHandler(wd_select, pattern="^wd_"))
@@ -862,6 +861,8 @@ def main():
     app.add_handler(CallbackQueryHandler(pair_cb, pattern="^pair"))
     app.add_handler(CallbackQueryHandler(delacc_cb, pattern="^delacc_"))
     app.add_handler(CallbackQueryHandler(comment_skip_cb, pattern="^comment_skip$"))
+    
+    # 2. SPECIFIC ReplyKeyboard buttons - THESE MUST BE BEFORE generic text
     app.add_handler(MessageHandler(filters.Regex("^📝 Log Trade$"), txt_log))
     app.add_handler(MessageHandler(filters.Regex("^✅ Close Trade$"), txt_close))
     app.add_handler(MessageHandler(filters.Regex("^💰 Balance$"), txt_balance))
@@ -870,12 +871,18 @@ def main():
     app.add_handler(MessageHandler(filters.Regex("^📖 Journal$"), txt_journal))
     app.add_handler(MessageHandler(filters.Regex("^📈 My Pairs$"), txt_pairs))
     app.add_handler(MessageHandler(filters.Regex("^📜 Trade History$"), txt_hist))
+    app.add_handler(MessageHandler(filters.Regex("^🖼 Gallery$"), txt_gallery))
     app.add_handler(MessageHandler(filters.Regex("^➕ Add Account$"), txt_add))
     app.add_handler(MessageHandler(filters.Regex("^💰 Wallet & Tools$"), txt_profit))
     app.add_handler(MessageHandler(filters.Regex("^👑 ADMIN PANEL$"), txt_admin))
-    app.add_handler(MessageHandler(filters.Regex("^🖼 Gallery$"), txt_gallery))
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, text_handler))
+    
+    # 3. Photos
     app.add_handler(MessageHandler(filters.PHOTO, photo_handler))
+    
+    # 4. Generic text LAST (this was eating everything before)
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, text_handler))
+    
+    print("Bot started...")
     app.run_polling()
 
 if __name__ == "__main__":
