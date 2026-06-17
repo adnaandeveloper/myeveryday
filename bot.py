@@ -806,11 +806,44 @@ async def txt_accounts(update, ctx): await handle_main_text(update, ctx, "menu_a
 async def txt_analyse(update, ctx): await handle_main_text(update, ctx, "menu_analyse")
 async def txt_journal(update, ctx): await handle_main_text(update, ctx, "menu_journal")
 async def txt_pairs(update, ctx): await handle_main_text(update, ctx, "menu_pairs")
-async def txt_hist(update, ctx): await handle_main_text(update, ctx, "menu_hist")
+
+async def txt_hist(update, ctx):
+    s = Session()
+    u = get_user(update.effective_user.id)
+    tas = s.query(TradeAccount).join(Trade).filter(Trade.user_id == u.id).filter(TradeAccount.closed_at!= None).order_by(TradeAccount.closed_at.desc()).limit(20).all()
+    msg = "📜 History\n\n"
+    for ta in tas:
+        tr = s.query(Trade).get(ta.trade_id)
+        acc = s.query(Account).get(ta.account_id)
+        if tr and ta.pnl_usd is not None:
+            msg += f"{tr.opened_at.strftime('%d %b')} {tr.symbol} {ta.result or ''} ${ta.pnl_usd:+.0f} ({acc.name})\n"
+    s.close()
+    await update.message.reply_text(msg or "No history yet", reply_markup=back_button())
+
 async def txt_add(update, ctx): await handle_main_text(update, ctx, "menu_add")
 async def txt_profit(update, ctx): await handle_main_text(update, ctx, "menu_profit")
 async def txt_admin(update, ctx): await handle_main_text(update, ctx, "menu_admin")
-async def txt_gallery(update, ctx): await handle_main_text(update, ctx, "menu_gallery")
+
+async def txt_gallery(update, ctx):
+    s = Session()
+    u = get_user(update.effective_user.id)
+    trades = s.query(Trade).filter_by(user_id=u.id).filter(Trade.before_photo!= None).order_by(Trade.opened_at.desc()).all()
+    s.close()
+    if not trades:
+        await update.message.reply_text("🖼 No photos yet", reply_markup=back_button())
+        return
+    await update.message.reply_text(f"🖼 Gallery - {len(trades)} trades")
+    for tr in trades:
+        cap = f"{tr.symbol} {tr.direction} • {tr.opened_at.strftime('%d %b %Y')}"
+        if tr.close_comment:
+            cap += f"\n💬 {tr.close_comment}"
+        try:
+            if tr.before_photo:
+                await update.message.reply_photo(tr.before_photo, caption="BEFORE: " + cap)
+            if tr.after_photo:
+                await update.message.reply_photo(tr.after_photo, caption="AFTER: " + cap)
+        except:
+            continue
 
 def main():
     app = Application.builder().token(os.getenv("TELEGRAM_BOT_TOKEN")).build()
