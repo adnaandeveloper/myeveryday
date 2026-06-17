@@ -287,33 +287,35 @@ async def menu_cb(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         await q.edit_message_text("📖 Journal - Select Month", reply_markup=InlineKeyboardMarkup(kb))
         return
     if d == "menu_hist":
-        tas = s.query(TradeAccount).join(Trade).filter(Trade.user_id == u.id).order_by(TradeAccount.closed_at.desc()).limit(15).all()
-        msg = "📜 History\n"
+        tas = s.query(TradeAccount).join(Trade).filter(Trade.user_id == u.id).filter(TradeAccount.closed_at!= None).order_by(TradeAccount.closed_at.desc()).limit(20).all()
+        msg = "📜 History\n\n"
         for ta in tas:
             tr = s.query(Trade).get(ta.trade_id)
             acc = s.query(Account).get(ta.account_id)
-            if tr and tr.closed_at:
-                msg += f"{tr.symbol} {ta.result} ${ta.pnl_usd:+.0f} ({acc.name})\n"
+            if tr and ta.pnl_usd is not None:
+                msg += f"{tr.opened_at.strftime('%d %b')} {tr.symbol} {ta.result or ''} ${ta.pnl_usd:+.0f} ({acc.name})\n"
         s.close()
-        await q.edit_message_text(msg or "No history", reply_markup=back_button())
+        await q.edit_message_text(msg or "No history yet", reply_markup=back_button())
         return
     if d == "menu_gallery":
-        trades = s.query(Trade).filter_by(user_id=u.id).filter(Trade.before_photo!=None).order_by(Trade.opened_at.desc()).all()
+        trades = s.query(Trade).filter_by(user_id=u.id).filter(Trade.before_photo!= None).order_by(Trade.opened_at.desc()).all()
         s.close()
         if not trades:
             await q.edit_message_text("🖼 No photos yet", reply_markup=back_button())
             return
-        await q.edit_message_text(f"🖼 Sending ALL {len(trades)} trades...", reply_markup=back_button())
+        await q.message.reply_text(f"🖼 Gallery - {len(trades)} trades")
+        await q.edit_message_text("Loading gallery...", reply_markup=back_button())
         for tr in trades:
-            cap = f"{tr.symbol} {tr.direction} • {tr.opened_at.strftime('%d %b')}"
+            cap = f"{tr.symbol} {tr.direction} • {tr.opened_at.strftime('%d %b %Y')}"
             if tr.close_comment:
                 cap += f"\n💬 {tr.close_comment}"
-            if tr.before_photo:
-                try: await q.message.reply_photo(tr.before_photo, caption="BEFORE: "+cap)
-                except: pass
-            if tr.after_photo:
-                try: await q.message.reply_photo(tr.after_photo, caption="AFTER: "+cap)
-                except: pass
+            try:
+                if tr.before_photo:
+                    await q.message.reply_photo(tr.before_photo, caption="BEFORE: " + cap)
+                if tr.after_photo:
+                    await q.message.reply_photo(tr.after_photo, caption="AFTER: " + cap)
+            except:
+                continue
         return
     if d == "menu_admin":
         if not is_admin(q.from_user.id):
