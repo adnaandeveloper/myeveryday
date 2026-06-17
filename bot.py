@@ -130,7 +130,7 @@ def profit_menu():
 async def start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     get_user(update.effective_user.id)
     ctx.user_data.clear()
-    await update.message.reply_text("📊 Trading Journal", reply_markup=main_menu(update.effective_user.id))
+    await update.message.reply_text("💰 My Bank", reply_markup=main_menu(update.effective_user.id))
 
 async def clear_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("🧹 Tap my name → Clear History")
@@ -139,7 +139,7 @@ async def back_main(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
     await q.answer()
     ctx.user_data.clear()
-    await q.message.reply_text("📊 Trading Journal", reply_markup=main_menu(q.from_user.id))
+    await q.message.reply_text("💰 My Bank", reply_markup=main_menu(q.from_user.id))
     try:
         await q.message.delete()
     except:
