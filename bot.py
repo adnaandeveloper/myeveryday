@@ -843,7 +843,7 @@ async def txt_admin(update, ctx):
 async def txt_gallery(update, ctx):
     s = Session()
     u = get_user(update.effective_user.id)
-    trades = s.query(Trade).filter_by(user_id=u.id).filter(Trade.before_photo!= None).order_by(Trade.opened_at.desc()).all()
+    trades = s.query(Trade).filter_by(user_id=u.id).filter(Trade.before_photo!= None).order_by(Trade.opened_at.asc()).all()
     s.close()
     if not trades:
         await update.message.reply_text("🖼 No photos yet", reply_markup=back_button())
