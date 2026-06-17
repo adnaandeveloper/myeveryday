@@ -732,10 +732,38 @@ async def photo_handler(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     s.close()
 
 async def txt_log(update, ctx):
-    await update.message.reply_text("Use the menu to log trade", reply_markup=main_menu(update.effective_user.id))
+    s = Session()
+    u = get_user(update.effective_user.id)
+    accs = s.query(Account).filter_by(user_id=u.id, status='ACTIVE').all()
+    s.close()
+    
+    if not accs:
+        await update.message.reply_text("⚠ No active accounts. Add one first.", reply_markup=main_menu(update.effective_user.id))
+        return
+    
+    ctx.user_data['mode'] = 'trade'
+    ctx.user_data['trade'] = {}
+    
+    kb = [[InlineKeyboardButton(a.name, callback_data=f"ta_{a.id}")] for a in accs]
+    kb.append([InlineKeyboardButton("All Accounts", callback_data="ta_all")])
+    kb.append([InlineKeyboardButton("⬅ Back", callback_data="back_main")])
+    
+    await update.message.reply_text("Select account:", reply_markup=InlineKeyboardMarkup(kb))
 
 async def txt_close(update, ctx):
-    await update.message.reply_text("Use the menu to close trade", reply_markup=main_menu(update.effective_user.id))
+    s = Session()
+    u = get_user(update.effective_user.id)
+    trs = s.query(Trade).filter_by(user_id=u.id, closed_at=None).all()
+    s.close()
+    
+    if not trs:
+        await update.message.reply_text("No open trades", reply_markup=main_menu(update.effective_user.id))
+        return
+    
+    kb = [[InlineKeyboardButton(f"{t.symbol} {t.direction}", callback_data=f"tc_{t.id}")] for t in trs]
+    kb.append([InlineKeyboardButton("⬅ Back", callback_data="back_main")])
+    
+    await update.message.reply_text("Select trade to close:", reply_markup=InlineKeyboardMarkup(kb))
 
 async def txt_balance(update, ctx):
     s = Session()
