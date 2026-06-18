@@ -135,6 +135,9 @@ async def start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 async def clear_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("🧹 Tap my name → Clear History")
 
+async def cmd_pairs(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    await txt_pairs(update, ctx)
+
 async def back_main(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
     await q.answer()
@@ -176,11 +179,6 @@ async def deposit_select(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     ctx.user_data['mode'] = 'deposit'
     ctx.user_data['deposit_acc'] = q.data[8:]
     await q.edit_message_text("How much to deposit?", reply_markup=back_tools())
-
-    async def cmd_pairs(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    await txt_pairs(update, ctx)
-
-
 
 async def menu_cb(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
@@ -474,7 +472,7 @@ async def close_acc_select(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     data = q.data
     if data == "closeacc_done":
         ctx.user_data['mode'] = 'await_comment'
-        await q.edit_message_text("✍️ Add closing note? (optional)", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("⏭ Skip", callback_data="comment_skip")]]))
+        await q.edit_message_text("✍ Add closing note? (optional)", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("⏭ Skip", callback_data="comment_skip")]]))
         return
     code = data.split('_')[1]
     acc_id = ctx.user_data['close']['map'][code]
@@ -741,18 +739,18 @@ async def txt_log(update, ctx):
     u = get_user(update.effective_user.id)
     accs = s.query(Account).filter_by(user_id=u.id, status='ACTIVE').all()
     s.close()
-    
+
     if not accs:
         await update.message.reply_text("⚠ No active accounts. Add one first.", reply_markup=main_menu(update.effective_user.id))
         return
-    
+
     ctx.user_data['mode'] = 'trade'
     ctx.user_data['trade'] = {}
-    
+
     kb = [[InlineKeyboardButton(a.name, callback_data=f"ta_{a.id}")] for a in accs]
     kb.append([InlineKeyboardButton("All Accounts", callback_data="ta_all")])
     kb.append([InlineKeyboardButton("⬅ Back", callback_data="back_main")])
-    
+
     await update.message.reply_text("Select account:", reply_markup=InlineKeyboardMarkup(kb))
 
 async def txt_close(update, ctx):
@@ -760,14 +758,14 @@ async def txt_close(update, ctx):
     u = get_user(update.effective_user.id)
     trs = s.query(Trade).filter_by(user_id=u.id, closed_at=None).all()
     s.close()
-    
+
     if not trs:
         await update.message.reply_text("No open trades", reply_markup=main_menu(update.effective_user.id))
         return
-    
+
     kb = [[InlineKeyboardButton(f"{t.symbol} {t.direction}", callback_data=f"tc_{t.id}")] for t in trs]
     kb.append([InlineKeyboardButton("⬅ Back", callback_data="back_main")])
-    
+
     await update.message.reply_text("Select trade to close:", reply_markup=InlineKeyboardMarkup(kb))
 
 async def txt_balance(update, ctx):
@@ -820,11 +818,11 @@ async def txt_pairs(update, ctx):
     u = get_user(update.effective_user.id)
     pairs = s.query(Pair).filter_by(user_id=u.id).all()
     s.close()
-    
+
     kb = [[InlineKeyboardButton(f"❌ {p.symbol}", callback_data=f"pairdel_{p.id}")] for p in pairs]
     kb.append([InlineKeyboardButton("➕ Add Pair", callback_data="pair_add")])
     kb.append([InlineKeyboardButton("⬅ Back to Menu", callback_data="back_main")])
-    
+
     await update.message.reply_text("📈 My Pairs", reply_markup=InlineKeyboardMarkup(kb))
 
 async def txt_hist(update, ctx):
@@ -869,13 +867,14 @@ async def txt_gallery(update, ctx):
                 await update.message.reply_photo(tr.after_photo, caption="AFTER: " + cap)
         except:
             continue
+
 def main():
     app = Application.builder().token(os.getenv("TELEGRAM_BOT_TOKEN")).build()
-    
+
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("clear", clear_cmd))
     app.add_handler(CommandHandler("pairs", cmd_pairs))
-    
+
     # 1. Callbacks first
     app.add_handler(CallbackQueryHandler(back_main, pattern="^back_main$"))
     app.add_handler(CallbackQueryHandler(menu_cb, pattern="^(menu_|bal_|clear_|add_)"))
@@ -899,8 +898,8 @@ def main():
     app.add_handler(CallbackQueryHandler(pair_cb, pattern="^pair"))
     app.add_handler(CallbackQueryHandler(delacc_cb, pattern="^delacc_"))
     app.add_handler(CallbackQueryHandler(comment_skip_cb, pattern="^comment_skip$"))
-    
-    # 2. SPECIFIC ReplyKeyboard buttons - THESE MUST BE BEFORE generic text
+
+    # 2. SPECIFIC ReplyKeyboard buttons
     app.add_handler(MessageHandler(filters.Regex("^📝 Log Trade$"), txt_log))
     app.add_handler(MessageHandler(filters.Regex("^✅ Close Trade$"), txt_close))
     app.add_handler(MessageHandler(filters.Regex("^💰 Balance$"), txt_balance))
@@ -913,13 +912,13 @@ def main():
     app.add_handler(MessageHandler(filters.Regex("^➕ Add Account$"), txt_add))
     app.add_handler(MessageHandler(filters.Regex("^💰 Wallet & Tools$"), txt_profit))
     app.add_handler(MessageHandler(filters.Regex("^👑 ADMIN PANEL$"), txt_admin))
-    
+
     # 3. Photos
     app.add_handler(MessageHandler(filters.PHOTO, photo_handler))
-    
-    # 4. Generic text LAST (this was eating everything before)
+
+    # 4. Generic text LAST
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, text_handler))
-    
+
     print("Bot started...")
     app.run_polling()
 
