@@ -177,6 +177,11 @@ async def deposit_select(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     ctx.user_data['deposit_acc'] = q.data[8:]
     await q.edit_message_text("How much to deposit?", reply_markup=back_tools())
 
+    async def cmd_pairs(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    await txt_pairs(update, ctx)
+
+
+
 async def menu_cb(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
     await q.answer()
@@ -815,8 +820,12 @@ async def txt_pairs(update, ctx):
     u = get_user(update.effective_user.id)
     pairs = s.query(Pair).filter_by(user_id=u.id).all()
     s.close()
-    msg = "📈 My Pairs\n" + "\n".join([p.symbol for p in pairs])
-    await update.message.reply_text(msg or "No pairs", reply_markup=back_button())
+    
+    kb = [[InlineKeyboardButton(f"❌ {p.symbol}", callback_data=f"pairdel_{p.id}")] for p in pairs]
+    kb.append([InlineKeyboardButton("➕ Add Pair", callback_data="pair_add")])
+    kb.append([InlineKeyboardButton("⬅ Back to Menu", callback_data="back_main")])
+    
+    await update.message.reply_text("📈 My Pairs", reply_markup=InlineKeyboardMarkup(kb))
 
 async def txt_hist(update, ctx):
     s = Session()
@@ -865,6 +874,7 @@ def main():
     
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("clear", clear_cmd))
+    app.add_handler(CommandHandler("pairs", cmd_pairs))
     
     # 1. Callbacks first
     app.add_handler(CallbackQueryHandler(back_main, pattern="^back_main$"))
