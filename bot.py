@@ -4,7 +4,7 @@ load_dotenv()
 
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, ReplyKeyboardMarkup, KeyboardButton
 from telegram.ext import Application, CommandHandler, ContextTypes, CallbackQueryHandler, MessageHandler, filters
-from sqlalchemy import create_engine, Column, String, Float, DateTime, ForeignKey, Text, UniqueConstraint, func, extract
+from sqlalchemy import create_engine, Column, String, Float, DateTime, ForeignKey, Text, UniqueConstraint, func, extract, text, inspect
 from sqlalchemy.orm import declarative_base, sessionmaker
 from datetime import datetime
 import uuid
@@ -55,6 +55,7 @@ class Trade(Base):
     before_photo = Column(String)
     after_photo = Column(String)
     close_comment = Column(Text)
+    before_comment = Column(Text)
     opened_at = Column(DateTime, default=datetime.utcnow)
     closed_at = Column(DateTime)
 
@@ -80,6 +81,14 @@ ADMIN_IDS = os.getenv("ADMIN_IDS", "").split(",")
 engine = create_engine(DATABASE_URL, future=True)
 Session = sessionmaker(bind=engine)
 Base.metadata.create_all(engine)
+try:
+    cols = [c['name'] for c in inspect(engine).get_columns('trades')]
+    if 'before_comment' not in cols:
+        with engine.connect() as conn:
+            conn.execute(text("ALTER TABLE trades ADD COLUMN before_comment TEXT"))
+            conn.commit()
+except:
+    pass
 
 def get_user(tid):
     s = Session()
@@ -147,6 +156,12 @@ async def back_main(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         await q.message.delete()
     except:
         pass
+
+async def before_skip_cb(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    await q.answer()
+    ctx.user_data.clear()
+    await q.edit_message_text("✅ Trade logged", reply_markup=main_menu(q.from_user.id))
 
 async def archive_acc(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
@@ -263,17 +278,8 @@ async def menu_cb(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         await q.edit_message_text("📈 My Pairs", reply_markup=InlineKeyboardMarkup(kb))
         return
     if d == "menu_analyse":
-        trades = s.query(Trade).filter_by(user_id=u.id).filter(Trade.closed_at!= None).all()
-        tas = s.query(TradeAccount).join(Trade).filter(Trade.user_id == u.id).filter(TradeAccount.pnl_usd!= None).all()
-        total = len(tas)
-        wins = len([t for t in tas if t.pnl_usd > 0])
-        winrate = (wins / total * 100) if total else 0
-        avg_rr = sum(t.rr for t in trades if t.rr) / len(trades) if trades else 0
-        total_pnl = sum(t.pnl_usd for t in tas)
-        msg = f"📊 Analyse\n\nTrades: {total}\nWin Rate: {winrate:.1f}%\nAvg RR: {avg_rr:.2f}\nTotal PnL: ${total_pnl:.2f}"
         s.close()
-        await q.edit_message_text(msg, reply_markup=back_button())
-        return
+        return await txt_analyse(update, ctx)
     s.close()
 
 async def profit_cb(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
@@ -564,8 +570,10 @@ async def view_trade_cb(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     msg = f"📊 {tr.symbol} {tr.direction}\n📅 Opened: {tr.opened_at.strftime('%d %b %Y %H:%M')}\n"
     if tr.closed_at:
         msg += f"🔒 Closed: {tr.closed_at.strftime('%d %b %Y %H:%M')}\n"
+    if tr.before_comment:
+        msg += f"💬 Before: {tr.before_comment}\n"
     if tr.close_comment:
-        msg += f"💬 Note: {tr.close_comment}\n"
+        msg += f"💬 After: {tr.close_comment}\n"
     tas = s.query(TradeAccount).filter_by(trade_id=tid).all()
     if tas:
         total_pnl = sum(ta.pnl_usd or 0 for ta in tas)
@@ -705,6 +713,16 @@ async def text_handler(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         ctx.user_data['close']['tas'][acc_id] = pnl
         ctx.user_data['mode'] = 'close'
         await show_close_accounts_menu(update, ctx)
+    elif mode == 'await_before_comment':
+        tid = ctx.user_data.get('before_trade_id')
+        tr = s.query(Trade).get(tid)
+        if tr:
+            tr.before_comment = txt
+            s.commit()
+        ctx.user_data.clear()
+        await update.message.reply_text("✅ Trade logged with note", reply_markup=main_menu(update.effective_user.id))
+        s.close()
+        return
     elif mode == 'await_comment':
         await finalize_trade(update, ctx, txt)
         s.close()
@@ -723,8 +741,11 @@ async def photo_handler(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         for aid in t['acc_ids']:
             s.add(TradeAccount(trade_id=tr.id, account_id=aid))
         s.commit()
-        ctx.user_data.clear()
-        await update.message.reply_text(f"✅ Trade logged", reply_markup=main_menu(update.effective_user.id))
+        ctx.user_data['mode'] = 'await_before_comment'
+        ctx.user_data['before_trade_id'] = tr.id
+        await update.message.reply_text("✍ Add note for BEFORE photo? (optional)", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("⏭ Skip", callback_data="before_skip")]]))
+        s.close()
+        return
     elif mode == 'close' and ctx.user_data.get('close', {}).get('step') == 'photo':
         tid = ctx.user_data['close']['id']
         tr = s.query(Trade).get(tid)
@@ -746,18 +767,14 @@ async def txt_log(update, ctx):
     u = get_user(update.effective_user.id)
     accs = s.query(Account).filter_by(user_id=u.id, status='ACTIVE').all()
     s.close()
-
     if not accs:
         await update.message.reply_text("⚠ No active accounts. Add one first.", reply_markup=main_menu(update.effective_user.id))
         return
-
     ctx.user_data['mode'] = 'trade'
     ctx.user_data['trade'] = {}
-
     kb = [[InlineKeyboardButton(a.name, callback_data=f"ta_{a.id}")] for a in accs]
     kb.append([InlineKeyboardButton("All Accounts", callback_data="ta_all")])
     kb.append([InlineKeyboardButton("⬅ Back", callback_data="back_main")])
-
     await update.message.reply_text("Select account:", reply_markup=InlineKeyboardMarkup(kb))
 
 async def txt_close(update, ctx):
@@ -765,14 +782,11 @@ async def txt_close(update, ctx):
     u = get_user(update.effective_user.id)
     trs = s.query(Trade).filter_by(user_id=u.id, closed_at=None).all()
     s.close()
-
     if not trs:
         await update.message.reply_text("No open trades", reply_markup=main_menu(update.effective_user.id))
         return
-
     kb = [[InlineKeyboardButton(f"{t.symbol} {t.direction}", callback_data=f"tc_{t.id}")] for t in trs]
     kb.append([InlineKeyboardButton("⬅ Back", callback_data="back_main")])
-
     await update.message.reply_text("Select trade to close:", reply_markup=InlineKeyboardMarkup(kb))
 
 async def txt_balance(update, ctx):
@@ -793,13 +807,24 @@ async def txt_accounts(update, ctx):
 async def txt_analyse(update, ctx):
     s = Session()
     u = get_user(update.effective_user.id)
+    trades = s.query(Trade).filter_by(user_id=u.id).filter(Trade.closed_at!= None).all()
     tas = s.query(TradeAccount).join(Trade).filter(Trade.user_id == u.id).filter(TradeAccount.pnl_usd!= None).all()
-    total = len(tas)
+    total_trades = len(trades)
+    total_entries = len(tas)
     wins = len([t for t in tas if t.pnl_usd > 0])
-    winrate = (wins / total * 100) if total else 0
+    winrate = (wins / total_entries * 100) if total_entries else 0
+    avg_rr = sum(t.rr for t in trades if t.rr) / len(trades) if trades else 0
     total_pnl = sum(t.pnl_usd for t in tas)
+    sl = tp = be = 0
+    for tr in trades:
+        ta = s.query(TradeAccount).filter_by(trade_id=tr.id).first()
+        if ta and ta.result:
+            if ta.result == 'SL': sl += 1
+            elif ta.result == 'TP': tp += 1
+            elif ta.result == 'BE': be += 1
     s.close()
-    await update.message.reply_text(f"📊 Analyse\nTrades: {total}\nWin Rate: {winrate:.1f}%\nTotal PnL: ${total_pnl:.2f}", reply_markup=back_button())
+    msg = f"📊 Analyse\n\nTrades: {total_trades}\nWin Rate: {winrate:.1f}%\nAvg RR: {avg_rr:.2f}\nTotal PnL: ${total_pnl:.2f}\n\nResults:\n✅ TP: {tp}\n❌ SL: {sl}\n➖ BE: {be}"
+    await update.message.reply_text(msg, reply_markup=back_button())
 
 async def txt_journal(update, ctx):
     s = Session()
@@ -825,11 +850,9 @@ async def txt_pairs(update, ctx):
     u = get_user(update.effective_user.id)
     pairs = s.query(Pair).filter_by(user_id=u.id).all()
     s.close()
-
     kb = [[InlineKeyboardButton(f"❌ {p.symbol}", callback_data=f"pairdel_{p.id}")] for p in pairs]
     kb.append([InlineKeyboardButton("➕ Add Pair", callback_data="pair_add")])
     kb.append([InlineKeyboardButton("⬅ Back to Menu", callback_data="back_main")])
-
     await update.message.reply_text("📈 My Pairs", reply_markup=InlineKeyboardMarkup(kb))
 
 async def txt_hist(update, ctx):
@@ -858,32 +881,37 @@ async def txt_gallery(update, ctx):
     s = Session()
     u = get_user(update.effective_user.id)
     trades = s.query(Trade).filter_by(user_id=u.id).filter(Trade.before_photo!= None).order_by(Trade.opened_at.asc()).all()
-    s.close()
     if not trades:
+        s.close()
         await update.message.reply_text("🖼 No photos yet", reply_markup=back_button())
         return
     await update.message.reply_text(f"🖼 Gallery - {len(trades)} trades")
     for tr in trades:
-        cap = f"{tr.symbol} {tr.direction} • {tr.opened_at.strftime('%d %b %Y')}"
+        ta = s.query(TradeAccount).filter_by(trade_id=tr.id).first()
+        result = f" • {ta.result}" if ta and ta.result else ""
+        base = f"{tr.symbol} {tr.direction} • {tr.opened_at.strftime('%d %b %Y')}{result}"
+        before_cap = "BEFORE: " + base
+        if tr.before_comment:
+            before_cap += f"\n💬 {tr.before_comment}"
+        after_cap = "AFTER: " + base
         if tr.close_comment:
-            cap += f"\n💬 {tr.close_comment}"
+            after_cap += f"\n💬 {tr.close_comment}"
         try:
             if tr.before_photo:
-                await update.message.reply_photo(tr.before_photo, caption="BEFORE: " + cap)
+                await update.message.reply_photo(tr.before_photo, caption=before_cap)
             if tr.after_photo:
-                await update.message.reply_photo(tr.after_photo, caption="AFTER: " + cap)
+                await update.message.reply_photo(tr.after_photo, caption=after_cap)
         except:
             continue
+    s.close()
 
 def main():
     app = Application.builder().token(os.getenv("TELEGRAM_BOT_TOKEN")).build()
-
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("clear", clear_cmd))
     app.add_handler(CommandHandler("pairs", cmd_pairs))
-
-    # 1. Callbacks first
     app.add_handler(CallbackQueryHandler(back_main, pattern="^back_main$"))
+    app.add_handler(CallbackQueryHandler(before_skip_cb, pattern="^before_skip$"))
     app.add_handler(CallbackQueryHandler(menu_cb, pattern="^(menu_|bal_|clear_|add_)"))
     app.add_handler(CallbackQueryHandler(profit_cb, pattern="^profit_"))
     app.add_handler(CallbackQueryHandler(archive_acc, pattern="^arch_"))
@@ -905,8 +933,6 @@ def main():
     app.add_handler(CallbackQueryHandler(pair_cb, pattern="^pair"))
     app.add_handler(CallbackQueryHandler(delacc_cb, pattern="^delacc_"))
     app.add_handler(CallbackQueryHandler(comment_skip_cb, pattern="^comment_skip$"))
-
-    # 2. SPECIFIC ReplyKeyboard buttons
     app.add_handler(MessageHandler(filters.Regex("^📝 Log Trade$"), txt_log))
     app.add_handler(MessageHandler(filters.Regex("^✅ Close Trade$"), txt_close))
     app.add_handler(MessageHandler(filters.Regex("^💰 Balance$"), txt_balance))
@@ -919,13 +945,8 @@ def main():
     app.add_handler(MessageHandler(filters.Regex("^➕ Add Account$"), txt_add))
     app.add_handler(MessageHandler(filters.Regex("^💰 Wallet & Tools$"), txt_profit))
     app.add_handler(MessageHandler(filters.Regex("^👑 ADMIN PANEL$"), txt_admin))
-
-    # 3. Photos
     app.add_handler(MessageHandler(filters.PHOTO, photo_handler))
-
-    # 4. Generic text LAST
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, text_handler))
-
     print("Bot started...")
     app.run_polling()
 
