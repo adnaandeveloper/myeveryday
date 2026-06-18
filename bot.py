@@ -731,7 +731,14 @@ async def photo_handler(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         tr.after_photo = update.message.photo[-1].file_id
         s.commit()
         ctx.user_data['close']['step'] = 'result'
-        await update.message.reply_text("SL or TP?", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("SL ❌", callback_data="res_SL"), InlineKeyboardButton("TP ✅", callback_data="res_TP")]]))
+        await update.message.reply_text(
+            "Close as?",
+            reply_markup=InlineKeyboardMarkup([[
+                InlineKeyboardButton("SL ❌", callback_data="res_SL"),
+                InlineKeyboardButton("BE ➖", callback_data="res_BE"),
+                InlineKeyboardButton("TP ✅", callback_data="res_TP")
+            ]])
+        )
     s.close()
 
 async def txt_log(update, ctx):
