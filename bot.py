@@ -9,6 +9,8 @@ from sqlalchemy.orm import declarative_base, sessionmaker
 import uuid
 import calendar
 from datetime import datetime, timedelta
+from PIL import Image, ImageDraw
+import io
 
 Base = declarative_base()
 
@@ -135,6 +137,29 @@ def profit_menu():
         [InlineKeyboardButton("🧹 Clean View", callback_data="clear_chat")],
         [InlineKeyboardButton("⬅ Back", callback_data="back_main")]
     ])
+
+async def send_badge_photo(bot, chat_id, file_id, caption, result):
+    try:
+        f = await bot.get_file(file_id)
+        data = await f.download_as_bytearray()
+        img = Image.open(io.BytesIO(data)).convert("RGBA")
+        w, h = img.size
+        s = int(min(w, h) * 0.18)
+        x, y = w - s - 30, 30
+        draw = ImageDraw.Draw(img)
+        if result == 'TP':
+            col = (34, 197, 94, 230); txt = "✓"
+        elif result == 'SL':
+            col = (239, 68, 230); txt = "✕"
+        else:
+            col = (251, 146, 60, 230); txt = "="
+        draw.ellipse([x, y, x+s, y+s], fill=col)
+        draw.text((x+s*0.32, y+s*0.18), txt, fill=(255,255))
+        bio = io.BytesIO(); bio.name = 'trade.png'
+        img.save(bio, 'PNG'); bio.seek(0)
+        return await bot.send_photo(chat_id, bio, caption=caption)
+    except Exception:
+        return await bot.send_photo(chat_id, file_id, caption=caption)
 
 async def start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     get_user(update.effective_user.id)
@@ -594,10 +619,19 @@ async def view_trade_cb(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         m1 = await q.message.reply_photo(tr.before_photo, caption="📸 BEFORE")
         photo_ids.append(m1.message_id)
     if tr.after_photo:
-        m2 = await q.message.reply_photo(tr.after_photo, caption="📸 AFTER")
-        photo_ids.append(m2.message_id)
+        ta = s.query(TradeAccount).filter_by(trade_id=tr.id).first()
+        res = ta.result if ta else None
+        cap = "📸 AFTER" + (f"\n💬 {tr.close_comment}" if tr.close_comment else "")
+        m2 = await send_badge_photo(q.message.bot, q.message.chat_id, tr.after_photo, cap, res)
+        if m2:
+            photo_ids.append(m2.message_id)
     ctx.user_data['last_photos'] = photo_ids
     s.close()
+
+#... [all your other functions continue exactly as you pasted them]...
+
+# Remember to add Pillow to requirements.txt:
+# Pillow==10.3.0
 
 async def admin_cb(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
