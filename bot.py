@@ -6,9 +6,9 @@ from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, ReplyKe
 from telegram.ext import Application, CommandHandler, ContextTypes, CallbackQueryHandler, MessageHandler, filters
 from sqlalchemy import create_engine, Column, String, Float, DateTime, ForeignKey, Text, UniqueConstraint, func, extract, text, inspect
 from sqlalchemy.orm import declarative_base, sessionmaker
-from datetime import datetime
 import uuid
 import calendar
+from datetime import datetime, timedelta
 
 Base = declarative_base()
 
@@ -824,7 +824,11 @@ async def txt_analyse(update, ctx):
             elif ta.result == 'BE': be += 1
     s.close()
     msg = f"📊 Analyse\n\nTrades: {total_trades}\nWin Rate: {winrate:.1f}%\nAvg RR: {avg_rr:.2f}\nTotal PnL: ${total_pnl:.2f}\n\nResults:\n✅ TP: {tp}\n❌ SL: {sl}\n➖ BE: {be}"
-    await update.message.reply_text(msg, reply_markup=back_button())
+    
+    if update.callback_query:
+        await update.callback_query.edit_message_text(msg, reply_markup=back_button())
+    else:
+        await update.message.reply_text(msg, reply_markup=back_button())
 
 async def txt_journal(update, ctx):
     s = Session()
@@ -878,14 +882,60 @@ async def txt_admin(update, ctx):
     await update.message.reply_text("👑 ADMIN", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("👥 Users", callback_data="admin_users")]]))
 
 async def txt_gallery(update, ctx):
+    kb = [
+        [InlineKeyboardButton("📅 Today", callback_data="gallery_today"), InlineKeyboardButton("📆 This Week", callback_data="gallery_week")],
+        [InlineKeyboardButton("🗓 This Month", callback_data="gallery_month"), InlineKeyboardButton("📈 This Year", callback_data="gallery_year")],
+        [InlineKeyboardButton("🌍 All Trades", callback_data="gallery_all")],
+        [InlineKeyboardButton("⬅ Back", callback_data="back_main")]
+    ]
+    await update.message.reply_text("🖼 Gallery - Choose period", reply_markup=InlineKeyboardMarkup(kb))
+
+async def gallery_cb(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    await q.answer()
+    data = q.data
     s = Session()
-    u = get_user(update.effective_user.id)
-    trades = s.query(Trade).filter_by(user_id=u.id).filter(Trade.before_photo!= None).order_by(Trade.opened_at.asc()).all()
+    u = get_user(q.from_user.id)
+    now = datetime.utcnow()
+
+    if data == "gallery_back":
+        s.close()
+        kb = [
+            [InlineKeyboardButton("📅 Today", callback_data="gallery_today"), InlineKeyboardButton("📆 This Week", callback_data="gallery_week")],
+            [InlineKeyboardButton("🗓 This Month", callback_data="gallery_month"), InlineKeyboardButton("📈 This Year", callback_data="gallery_year")],
+            [InlineKeyboardButton("🌍 All Trades", callback_data="gallery_all")],
+            [InlineKeyboardButton("⬅ Back", callback_data="back_main")]
+        ]
+        await q.edit_message_text("🖼 Gallery - Choose period", reply_markup=InlineKeyboardMarkup(kb))
+        return
+
+    if data == "gallery_today":
+        start = now.replace(hour=0, minute=0, second=0, microsecond=0)
+        trades = s.query(Trade).filter_by(user_id=u.id).filter(Trade.before_photo!=None, Trade.opened_at >= start).order_by(Trade.opened_at.asc()).all()
+        label = "Today"
+    elif data == "gallery_week":
+        start = (now - timedelta(days=now.weekday())).replace(hour=0, minute=0, second=0, microsecond=0)
+        trades = s.query(Trade).filter_by(user_id=u.id).filter(Trade.before_photo!=None, Trade.opened_at >= start).order_by(Trade.opened_at.asc()).all()
+        label = "This Week"
+    elif data == "gallery_month":
+        start = now.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
+        trades = s.query(Trade).filter_by(user_id=u.id).filter(Trade.before_photo!=None, Trade.opened_at >= start).order_by(Trade.opened_at.asc()).all()
+        label = "This Month"
+    elif data == "gallery_year":
+        start = now.replace(month=1, day=1, hour=0, minute=0, second=0, microsecond=0)
+        trades = s.query(Trade).filter_by(user_id=u.id).filter(Trade.before_photo!=None, Trade.opened_at >= start).order_by(Trade.opened_at.asc()).all()
+        label = "This Year"
+    else:
+        trades = s.query(Trade).filter_by(user_id=u.id).filter(Trade.before_photo!=None).order_by(Trade.opened_at.asc()).all()
+        label = "All Time"
+
     if not trades:
         s.close()
-        await update.message.reply_text("🖼 No photos yet", reply_markup=back_button())
+        await q.edit_message_text(f"🖼 No photos for {label}", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("⬅ Back", callback_data="gallery_back")]]))
         return
-    await update.message.reply_text(f"🖼 Gallery - {len(trades)} trades")
+
+    await q.edit_message_text(f"🖼 Gallery - {label} ({len(trades)} trades)", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("⬅ Back", callback_data="gallery_back")]]))
+    
     for tr in trades:
         ta = s.query(TradeAccount).filter_by(trade_id=tr.id).first()
         result = f" • {ta.result}" if ta and ta.result else ""
@@ -898,9 +948,9 @@ async def txt_gallery(update, ctx):
             after_cap += f"\n💬 {tr.close_comment}"
         try:
             if tr.before_photo:
-                await update.message.reply_photo(tr.before_photo, caption=before_cap)
+                await q.message.reply_photo(tr.before_photo, caption=before_cap)
             if tr.after_photo:
-                await update.message.reply_photo(tr.after_photo, caption=after_cap)
+                await q.message.reply_photo(tr.after_photo, caption=after_cap)
         except:
             continue
     s.close()
@@ -947,6 +997,7 @@ def main():
     app.add_handler(MessageHandler(filters.Regex("^👑 ADMIN PANEL$"), txt_admin))
     app.add_handler(MessageHandler(filters.PHOTO, photo_handler))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, text_handler))
+    app.add_handler(CallbackQueryHandler(gallery_cb, pattern="^gallery_"))
     print("Bot started...")
     app.run_polling()
 
