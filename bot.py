@@ -880,7 +880,7 @@ async def txt_hist(update, ctx):
         tr = s.query(Trade).get(ta.trade_id)
         acc = s.query(Account).get(ta.account_id)
         if tr and ta.pnl_usd is not None:
-            msg += f"{tr.opened_at.strftime('%d %b')} {tr.symbol} {ta.result or ''} ${ta.pnl_usd:+.0f} ({acc.name})\n"
+            msg += f"{tr.opened_at.strftime('%d %b %Y')} {tr.symbol} {ta.result or ''} ${ta.pnl_usd:+.0f} ({acc.name})\n"
     s.close()
     await update.message.reply_text(msg or "No history yet", reply_markup=back_button())
 
