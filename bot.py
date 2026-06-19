@@ -506,6 +506,7 @@ async def finalize_trade(src, ctx, comment):
     tr = s.query(Trade).get(tid)
     tr.closed_at = datetime.utcnow()
     tr.close_comment = comment
+    
     for acc_id, pnl in ctx.user_data['close']['tas'].items():
         ta = s.query(TradeAccount).filter_by(trade_id=tid, account_id=acc_id).first()
         ta.pnl_usd = pnl
@@ -513,14 +514,25 @@ async def finalize_trade(src, ctx, comment):
         ta.closed_at = datetime.utcnow()
         acc = s.query(Account).get(acc_id)
         acc.current_balance += pnl
+    
     s.commit()
     s.close()
+    
+    # FIXED: detect CallbackQuery vs Update correctly
+    if hasattr(src, 'from_user'):  # it's a button press
+        chat = src.message
+        user_id = src.from_user.id
+    else:  # it's a typed message
+        chat = src.effective_message
+        user_id = src.effective_user.id
+    
     ctx.user_data.clear()
-    txt = "✅ Trade closed." + (f"\n💬 {comment}" if comment else "")
-    if hasattr(src, 'edit_message_text'):
-        await src.edit_message_text(txt, reply_markup=main_menu(src.from_user.id))
-    else:
-        await src.message.reply_text(txt, reply_markup=main_menu(src.from_user.id))
+    
+    txt = "✅ Trade closed"
+    if comment:
+        txt += f"\n💬 {comment}"
+    
+    await chat.reply_text(txt, reply_markup=main_menu(user_id))
 
 async def journal_month_cb(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
