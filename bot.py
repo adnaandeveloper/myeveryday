@@ -896,30 +896,97 @@ async def txt_accounts(update, ctx):
     await update.message.reply_text(msg or "No accounts", reply_markup=back_button())
 
 async def txt_analyse(update, ctx):
-    s = Session()
-    u = get_user(update.effective_user.id)
-    trades = s.query(Trade).filter_by(user_id=u.id).filter(Trade.closed_at!= None).all()
-    tas = s.query(TradeAccount).join(Trade).filter(Trade.user_id == u.id).filter(TradeAccount.pnl_usd!= None).all()
-    total_trades = len(trades)
-    total_entries = len(tas)
-    wins = len([t for t in tas if t.pnl_usd > 0])
-    winrate = (wins / total_entries * 100) if total_entries else 0
-    avg_rr = sum(t.rr for t in trades if t.rr) / len(trades) if trades else 0
-    total_pnl = sum(t.pnl_usd for t in tas)
-    sl = tp = be = 0
-    for tr in trades:
-        ta = s.query(TradeAccount).filter_by(trade_id=tr.id).first()
-        if ta and ta.result:
-            if ta.result == 'SL': sl += 1
-            elif ta.result == 'TP': tp += 1
-            elif ta.result == 'BE': be += 1
-    s.close()
-    msg = f"📊 Analyse\n\nTrades: {total_trades}\nWin Rate: {winrate:.1f}%\nAvg RR: {avg_rr:.2f}\nTotal PnL: ${total_pnl:.2f}\n\nResults:\n✅ TP: {tp}\n❌ SL: {sl}\n➖ BE: {be}"
-
-    if update.callback_query:
-        await update.callback_query.edit_message_text(msg, reply_markup=back_button())
+    kb = [
+        [InlineKeyboardButton("📅 Today", callback_data="analyse_today"), InlineKeyboardButton("📆 This Week", callback_data="analyse_week")],
+        [InlineKeyboardButton("🗓 This Month", callback_data="analyse_month"), InlineKeyboardButton("📆 Last Month", callback_data="analyse_lastmonth")],
+        [InlineKeyboardButton("📈 This Year", callback_data="analyse_year"), InlineKeyboardButton("🌍 All Time", callback_data="analyse_all")],
+        [InlineKeyboardButton("⬅ Back", callback_data="back_main")]
+    ]
+    msg = "📊 Analyse - Choose period"
+    if hasattr(update, 'callback_query') and update.callback_query:
+        await update.callback_query.edit_message_text(msg, reply_markup=InlineKeyboardMarkup(kb))
     else:
-        await update.message.reply_text(msg, reply_markup=back_button())
+        await update.message.reply_text(msg, reply_markup=InlineKeyboardMarkup(kb))
+
+async def analyse_period_cb(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    await q.answer()
+    period = q.data.split('_')[1]
+    s = Session()
+    u = get_user(q.from_user.id)
+    now = datetime.utcnow()
+
+    if period == 'today':
+        start = now.replace(hour=0, minute=0, second=0, microsecond=0)
+        end = now
+        label = "TODAY"
+    elif period == 'week':
+        start = (now - timedelta(days=now.weekday())).replace(hour=0, minute=0, second=0, microsecond=0)
+        end = now
+        label = "THIS WEEK"
+    elif period == 'month':
+        start = now.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
+        end = now
+        label = "THIS MONTH"
+    elif period == 'lastmonth':
+        first_this = now.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
+        end = first_this - timedelta(seconds=1)
+        start = end.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
+        label = "LAST MONTH"
+    elif period == 'year':
+        start = now.replace(month=1, day=1, hour=0, minute=0, second=0, microsecond=0)
+        end = now
+        label = "THIS YEAR"
+    else:
+        start = None
+        end = None
+        label = "ALL TIME"
+
+    query = s.query(Trade).filter_by(user_id=u.id).filter(Trade.closed_at!= None)
+    if start:
+        query = query.filter(Trade.closed_at >= start)
+    if end and period!= 'all':
+        query = query.filter(Trade.closed_at <= end)
+    trades = query.all()
+
+    trade_ids = [t.id for t in trades]
+    tas = s.query(TradeAccount).filter(TradeAccount.trade_id.in_(trade_ids)).filter(TradeAccount.pnl_usd!= None).all() if trade_ids else []
+
+    total_trades = len(trades)
+    wins = len([t for t in tas if t.pnl_usd > 0])
+    losses = len([t for t in tas if t.pnl_usd < 0])
+    winrate = (wins / len(tas) * 100) if tas else 0
+    total_pnl = sum(t.pnl_usd for t in tas) if tas else 0
+    avg_win = sum(t.pnl_usd for t in tas if t.pnl_usd > 0) / wins if wins else 0
+    avg_loss = sum(t.pnl_usd for t in tas if t.pnl_usd < 0) / losses if losses else 0
+
+    tp = len([t for t in tas if t.result == 'TP'])
+    sl = len([t for t in tas if t.result == 'SL'])
+    be = len([t for t in tas if t.result == 'BE'])
+
+    pair_pnl = {}
+    for tr in trades:
+        for ta in [x for x in tas if x.trade_id == tr.id]:
+            pair_pnl[tr.symbol] = pair_pnl.get(tr.symbol, 0) + (ta.pnl_usd or 0)
+
+    best = max(pair_pnl.items(), key=lambda x: x[1]) if pair_pnl else ("-", 0)
+    worst = min(pair_pnl.items(), key=lambda x: x[1]) if pair_pnl else ("-", 0)
+
+    s.close()
+
+    date_str = f"{start.strftime('%d %b')} - {end.strftime('%d %b')}" if start and period!= 'all' else ""
+
+    msg = f"📊 {label} {date_str}\n\n"
+    msg += f"Trades: {total_trades}\n"
+    msg += f"Win Rate: {winrate:.1f}% ({wins}W/{losses}L)\n"
+    msg += f"Total PnL: ${total_pnl:+.2f}\n"
+    if wins or losses:
+        msg += f"Avg Win: ${avg_win:.0f} | Avg Loss: ${avg_loss:.0f}\n"
+    msg += f"\nBest: {best[0]} (${best[1]:+.0f})\n"
+    msg += f"Worst: {worst[0]} (${worst[1]:+.0f})\n\n"
+    msg += f"✅ TP:{tp} ❌ SL:{sl} ➖ BE:{be}"
+
+    await q.edit_message_text(msg, reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("⬅ Back", callback_data="menu_analyse")]]))
 
 async def txt_journal(update, ctx):
     s = Session()
@@ -1075,6 +1142,7 @@ def main():
     app.add_handler(CallbackQueryHandler(delacc_cb, pattern="^delacc_"))
     app.add_handler(CallbackQueryHandler(comment_skip_cb, pattern="^comment_skip$"))
     app.add_handler(CallbackQueryHandler(rules_cb, pattern="^rule_"))
+    app.add_handler(CallbackQueryHandler(analyse_period_cb, pattern="^analyse_"))
     app.add_handler(MessageHandler(filters.Regex("^📝 Log Trade$"), txt_log))
     app.add_handler(MessageHandler(filters.Regex("^✅ Close Trade$"), txt_close))
     app.add_handler(MessageHandler(filters.Regex("^💰 Balance$"), txt_balance))
