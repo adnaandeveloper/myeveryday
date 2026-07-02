@@ -76,6 +76,14 @@ class CashTx(Base):
     note = Column(Text)
     date = Column(DateTime, default=datetime.utcnow)
 
+class Rule(Base):
+    __tablename__ = 'rules'
+    id = Column(String, primary_key=True, default=uid)
+    user_id = Column(String, ForeignKey('users.id'))
+    text = Column(Text, nullable=False)
+    created_at = Column(DateTime, default=datetime.utcnow)
+    order_num = Column(Float, default=0)
+
 DATABASE_URL = os.getenv("DATABASE_URL", "sqlite:///./edgeflo.db")
 ADMIN_IDS = os.getenv("ADMIN_IDS", "").split(",")
 engine = create_engine(DATABASE_URL, future=True)
@@ -114,7 +122,7 @@ def main_menu(uid=None):
         [KeyboardButton("📊 Analyse"), KeyboardButton("📖 Journal")],
         [KeyboardButton("📈 My Pairs"), KeyboardButton("📜 Trade History")],
         [KeyboardButton("🖼 Gallery"), KeyboardButton("➕ Add Account")],
-        [KeyboardButton("💰 Wallet & Tools")],
+        [KeyboardButton("📏 My Rules"), KeyboardButton("💰 Wallet & Tools")],
     ]
     if uid and is_admin(uid):
         rows.append([KeyboardButton("👑 ADMIN PANEL")])
@@ -340,6 +348,7 @@ async def reset_yes(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     s.query(Account).filter_by(user_id=uid).delete()
     s.query(Pair).filter_by(user_id=uid).delete()
     s.query(CashTx).filter_by(user_id=uid).delete()
+    s.query(Rule).filter_by(user_id=uid).delete()
     s.commit()
     s.close()
     await q.edit_message_text("✅ Reset done", reply_markup=back_button())
@@ -506,7 +515,7 @@ async def finalize_trade(src, ctx, comment):
     tr = s.query(Trade).get(tid)
     tr.closed_at = datetime.utcnow()
     tr.close_comment = comment
-    
+
     for acc_id, pnl in ctx.user_data['close']['tas'].items():
         ta = s.query(TradeAccount).filter_by(trade_id=tid, account_id=acc_id).first()
         ta.pnl_usd = pnl
@@ -514,24 +523,23 @@ async def finalize_trade(src, ctx, comment):
         ta.closed_at = datetime.utcnow()
         acc = s.query(Account).get(acc_id)
         acc.current_balance += pnl
-    
+
     s.commit()
     s.close()
-    
-    # FIXED: detect CallbackQuery vs Update correctly
-    if hasattr(src, 'from_user'):  # it's a button press
+
+    if hasattr(src, 'from_user'):
         chat = src.message
         user_id = src.from_user.id
-    else:  # it's a typed message
+    else:
         chat = src.effective_message
         user_id = src.effective_user.id
-    
+
     ctx.user_data.clear()
-    
+
     txt = "✅ Trade closed"
     if comment:
         txt += f"\n💬 {comment}"
-    
+
     await chat.reply_text(txt, reply_markup=main_menu(user_id))
 
 async def journal_month_cb(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
@@ -647,6 +655,59 @@ async def delacc_cb(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     s.close()
     await q.edit_message_text("✅ Account deleted", reply_markup=back_button())
 
+async def txt_rules(update, ctx):
+    s = Session()
+    u = get_user(update.effective_user.id)
+    rules = s.query(Rule).filter_by(user_id=u.id).order_by(Rule.order_num, Rule.created_at).all()
+    s.close()
+    if not rules:
+        msg = "📏 My Rules\n\nNo rules yet. Add your trading rules to stay disciplined."
+    else:
+        msg = "📏 My Rules\n\n" + "\n\n".join([f"{i}. {r.text}" for i, r in enumerate(rules, 1)])
+    kb = []
+    for r in rules:
+        kb.append([InlineKeyboardButton("✏️", callback_data=f"rule_edit_{r.id}"), InlineKeyboardButton("🗑️", callback_data=f"rule_del_{r.id}")])
+    kb.append([InlineKeyboardButton("➕ Add Rule", callback_data="rule_add")])
+    kb.append([InlineKeyboardButton("⬅ Back", callback_data="back_main")])
+    await update.message.reply_text(msg, reply_markup=InlineKeyboardMarkup(kb))
+
+async def rules_cb(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    await q.answer()
+    data = q.data
+    s = Session()
+    u = get_user(q.from_user.id)
+    if data == "rule_add":
+        ctx.user_data['mode'] = 'rule_add'
+        await q.edit_message_text("✍️ Send your new trading rule:", reply_markup=back_button())
+        s.close()
+        return
+    elif data.startswith("rule_edit_"):
+        rid = data[10:]
+        rule = s.query(Rule).get(rid)
+        if rule and rule.user_id == u.id:
+            ctx.user_data['mode'] = 'rule_edit'
+            ctx.user_data['rule_id'] = rid
+            await q.edit_message_text(f"Current:\n{rule.text}\n\nSend new version:", reply_markup=back_button())
+        s.close()
+        return
+    elif data.startswith("rule_del_"):
+        rid = data[9:]
+        s.query(Rule).filter_by(id=rid, user_id=u.id).delete()
+        s.commit()
+    rules = s.query(Rule).filter_by(user_id=u.id).order_by(Rule.order_num, Rule.created_at).all()
+    s.close()
+    if not rules:
+        msg = "📏 My Rules\n\nNo rules yet."
+    else:
+        msg = "📏 My Rules\n\n" + "\n\n".join([f"{i}. {r.text}" for i, r in enumerate(rules, 1)])
+    kb = []
+    for r in rules:
+        kb.append([InlineKeyboardButton("✏️", callback_data=f"rule_edit_{r.id}"), InlineKeyboardButton("🗑️", callback_data=f"rule_del_{r.id}")])
+    kb.append([InlineKeyboardButton("➕ Add Rule", callback_data="rule_add")])
+    kb.append([InlineKeyboardButton("⬅ Back", callback_data="back_main")])
+    await q.edit_message_text(msg, reply_markup=InlineKeyboardMarkup(kb))
+
 async def text_handler(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     mode = ctx.user_data.get('mode')
     txt = update.message.text.strip()
@@ -714,6 +775,24 @@ async def text_handler(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         s.commit()
         ctx.user_data.clear()
         await update.message.reply_text(f"✅ Bank ${new_amt:.2f}", reply_markup=main_menu(update.effective_user.id))
+    elif mode == 'rule_add':
+        rule = Rule(user_id=u.id, text=txt, order_num=datetime.utcnow().timestamp())
+        s.add(rule)
+        s.commit()
+        ctx.user_data.clear()
+        await update.message.reply_text("✅ Rule added!", reply_markup=main_menu(update.effective_user.id))
+        s.close()
+        return
+    elif mode == 'rule_edit':
+        rid = ctx.user_data.get('rule_id')
+        rule = s.query(Rule).get(rid)
+        if rule and rule.user_id == u.id:
+            rule.text = txt
+            s.commit()
+        ctx.user_data.clear()
+        await update.message.reply_text("✅ Rule updated!", reply_markup=main_menu(update.effective_user.id))
+        s.close()
+        return
     elif mode == 'close_pnl':
         try:
             pnl = float(txt.replace('+',''))
@@ -836,7 +915,7 @@ async def txt_analyse(update, ctx):
             elif ta.result == 'BE': be += 1
     s.close()
     msg = f"📊 Analyse\n\nTrades: {total_trades}\nWin Rate: {winrate:.1f}%\nAvg RR: {avg_rr:.2f}\nTotal PnL: ${total_pnl:.2f}\n\nResults:\n✅ TP: {tp}\n❌ SL: {sl}\n➖ BE: {be}"
-    
+
     if update.callback_query:
         await update.callback_query.edit_message_text(msg, reply_markup=back_button())
     else:
@@ -947,7 +1026,7 @@ async def gallery_cb(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         return
 
     await q.edit_message_text(f"🖼 Gallery - {label} ({len(trades)} trades)", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("⬅ Back", callback_data="gallery_back")]]))
-    
+
     for tr in trades:
         ta = s.query(TradeAccount).filter_by(trade_id=tr.id).first()
         result = f" • {ta.result}" if ta and ta.result else ""
@@ -995,6 +1074,7 @@ def main():
     app.add_handler(CallbackQueryHandler(pair_cb, pattern="^pair"))
     app.add_handler(CallbackQueryHandler(delacc_cb, pattern="^delacc_"))
     app.add_handler(CallbackQueryHandler(comment_skip_cb, pattern="^comment_skip$"))
+    app.add_handler(CallbackQueryHandler(rules_cb, pattern="^rule_"))
     app.add_handler(MessageHandler(filters.Regex("^📝 Log Trade$"), txt_log))
     app.add_handler(MessageHandler(filters.Regex("^✅ Close Trade$"), txt_close))
     app.add_handler(MessageHandler(filters.Regex("^💰 Balance$"), txt_balance))
@@ -1007,6 +1087,7 @@ def main():
     app.add_handler(MessageHandler(filters.Regex("^➕ Add Account$"), txt_add))
     app.add_handler(MessageHandler(filters.Regex("^💰 Wallet & Tools$"), txt_profit))
     app.add_handler(MessageHandler(filters.Regex("^👑 ADMIN PANEL$"), txt_admin))
+    app.add_handler(MessageHandler(filters.Regex("^📏 My Rules$"), txt_rules))
     app.add_handler(MessageHandler(filters.PHOTO, photo_handler))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, text_handler))
     app.add_handler(CallbackQueryHandler(gallery_cb, pattern="^gallery_"))
