@@ -394,7 +394,19 @@ async def act_dir(update, ctx, arg):
 async def act_close_trade(update, ctx, arg):
     ctx.user_data['mode'] = 'close'
     ctx.user_data['close'] = {'id': arg, 'step': 'photo'}
-    await update.message.reply_text("Send AFTER photo", reply_markup=back_menu(ctx))
+    # If this trade already has an AFTER photo (e.g. reopening a partially
+    # closed multi-account trade), don't ask for the same image again.
+    s = Session()
+    tr = s.query(Trade).get(arg)
+    has_photo = bool(tr and tr.after_photo)
+    s.close()
+    if has_photo:
+        ctx.user_data['close']['step'] = 'result'
+        rows = [[("SL ❌", "close_res", "SL"), ("BE ➖", "close_res", "BE"), ("TP ✅", "close_res", "TP")]]
+        await update.message.reply_text("AFTER photo already saved. Close as?", reply_markup=screen(ctx, rows))
+    else:
+        await update.message.reply_text("Send AFTER photo", reply_markup=back_menu(ctx))
+
 
 async def act_close_res(update, ctx, arg):
     try:
@@ -422,23 +434,28 @@ async def show_close_accounts_menu(update, ctx):
     acc_pnls = ctx.user_data['close']['tas']
     s = Session()
     rows = []
-    all_done = True
+    filled = 0
+    total = 0
     for acc_id, pnl in acc_pnls.items():
         acc = s.query(Account).get(acc_id)
         if not acc:
             continue
+        total += 1
         if pnl is None:
             rows.append([(f"[ ] {acc.name}", "closeacc", acc_id)])
-            all_done = False
         else:
+            filled += 1
             rows.append([(f"[✅ ${pnl:+.0f}] {acc.name}", "closeacc", acc_id)])
-    if all_done:
+    # Always allow finishing early: close the accounts filled so far,
+    # leave the rest open to close later.
+    if filled > 0:
         rows.append([("✅ DONE - Add Comment", "closeacc_done", None)])
-    else:
-        rows.append([("⬅ Back to Menu", "main", None)])
+    rows.append([("⬅ Back to Menu", "main", None)])
     s.close()
     ctx.user_data['mode'] = 'close'
-    await update.message.reply_text(f"{res} hit. Tap each account:", reply_markup=screen(ctx, rows))
+    hint = f"{res} hit. Tap each account to set PnL ({filled}/{total} done).\nTap DONE anytime — unfilled accounts stay open."
+    await update.message.reply_text(hint, reply_markup=screen(ctx, rows))
+
 
 async def act_closeacc(update, ctx, arg):
     acc_id = arg
@@ -468,23 +485,37 @@ async def finalize_trade(update, ctx, comment):
     tid = ctx.user_data['close']['id']
     s = Session()
     tr = s.query(Trade).get(tid)
-    tr.closed_at = datetime.utcnow()
-    tr.close_comment = comment
+    result = ctx.user_data['close']['result']
+    closed_now = 0
     for acc_id, pnl in ctx.user_data['close']['tas'].items():
+        if pnl is None:
+            continue  # leave unfilled accounts open
         ta = s.query(TradeAccount).filter_by(trade_id=tid, account_id=acc_id).first()
+        if not ta or ta.closed_at is not None:
+            continue  # skip already-closed accounts (no double counting)
         ta.pnl_usd = pnl
-        ta.result = ctx.user_data['close']['result']
+        ta.result = result
         ta.closed_at = datetime.utcnow()
         acc = s.query(Account).get(acc_id)
         acc.current_balance += pnl
+        closed_now += 1
+    # Only close the whole trade once every account is closed.
+    open_remaining = s.query(TradeAccount).filter_by(trade_id=tid, closed_at=None).count()
+    if open_remaining == 0:
+        tr.closed_at = datetime.utcnow()
+        tr.close_comment = comment
     s.commit()
     s.close()
     user_id = update.effective_user.id
     ctx.user_data.clear()
-    txt = "✅ Trade closed"
-    if comment:
-        txt += f"\n💬 {comment}"
+    if open_remaining == 0:
+        txt = "✅ Trade fully closed"
+        if comment:
+            txt += f"\n💬 {comment}"
+    else:
+        txt = f"✅ Closed {closed_now} account(s).\n⏳ {open_remaining} still open — pick this trade again in Close Trade to finish."
     await update.message.reply_text(txt, reply_markup=main_menu(user_id))
+
 
 # ---------------------------------------------------------------------------
 # Wallet actions
