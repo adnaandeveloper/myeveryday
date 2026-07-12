@@ -613,11 +613,68 @@ async def act_profit_history(update, ctx, arg):
     s = Session()
     u = get_user(update.effective_user.id)
     txs = s.query(CashTx).filter_by(user_id=u.id).order_by(CashTx.date.desc()).limit(20).all()
-    msg = "📜 Bank History\n\n"
+    msg = "📜 Bank History\n(Tap a row to edit/delete)\n"
+    rows = []
     for t in txs:
-        msg += f"{t.date.strftime('%d/%m/%Y')} {t.type} ${t.amount:+.2f} - {t.note}\n"
+        label = f"{t.date.strftime('%d/%m')} {t.type} {t.amount:+.2f}"
+        rows.append([(f"✏ {label}", "tx_view", t.id)])
+    rows.append([("⬅ Back to Wallet", "wallet", None)])
     s.close()
-    await update.message.reply_text(msg or "No transactions", reply_markup=back_wallet(ctx))
+    await update.message.reply_text(msg if txs else "No transactions", reply_markup=screen(ctx, rows))
+
+async def act_tx_view(update, ctx, arg):
+    s = Session()
+    tx = s.query(CashTx).get(int(arg))
+    if not tx:
+        s.close()
+        await update.message.reply_text("Not found", reply_markup=back_wallet(ctx))
+        return
+    info = (f"📝 Edit Transaction\n"
+            f"Date: {tx.date.strftime('%d/%m/%Y %H:%M')}\n"
+            f"Type: {tx.type}\n"
+            f"Amount: {tx.amount:+.2f}\n"
+            f"Note: {tx.note}")
+    s.close()
+    rows = [
+        [("✏ Edit Amount", "tx_edit_amt", str(arg)), ("✏ Edit Note", "tx_edit_note", str(arg))],
+        [("🔄 Flip Sign (+/-)", "tx_flip", str(arg)), ("🗑 Delete", "tx_del", str(arg))],
+        [("⬅ Back to History", "profit_history", None)],
+    ]
+    await update.message.reply_text(info, reply_markup=screen(ctx, rows))
+
+async def act_tx_edit_amt(update, ctx, arg):
+    ctx.user_data['mode'] = 'tx_edit_amt'
+    ctx.user_data['tx_id'] = int(arg)
+    await update.message.reply_text("Send new amount (use - for money going OUT, e.g. -103 for a fee):", reply_markup=back_wallet(ctx))
+
+async def act_tx_edit_note(update, ctx, arg):
+    ctx.user_data['mode'] = 'tx_edit_note'
+    ctx.user_data['tx_id'] = int(arg)
+    await update.message.reply_text("Send new note text:", reply_markup=back_wallet(ctx))
+
+async def act_tx_flip(update, ctx, arg):
+    s = Session()
+    tx = s.query(CashTx).get(int(arg))
+    if tx:
+        tx.amount = -tx.amount
+        s.commit()
+        amt = tx.amount
+    s.close()
+    await update.message.reply_text(f"✅ Sign flipped. New amount: {amt:+.2f}", reply_markup=back_wallet(ctx))
+
+async def act_tx_del(update, ctx, arg):
+    rows = [[("✅ YES delete", "tx_del_yes", str(arg)), ("❌ No", "tx_view", str(arg))]]
+    await update.message.reply_text("Delete this transaction?", reply_markup=screen(ctx, rows))
+
+async def act_tx_del_yes(update, ctx, arg):
+    s = Session()
+    tx = s.query(CashTx).get(int(arg))
+    if tx:
+        s.delete(tx)
+        s.commit()
+    s.close()
+    await update.message.reply_text("🗑 Deleted", reply_markup=back_wallet(ctx))
+    await act_profit_history(update, ctx, None)
 
 async def act_profit_reset(update, ctx, arg):
     rows = [[("✅ YES", "reset_yes", None), ("❌ No", "wallet", None)]]
@@ -1041,6 +1098,12 @@ DISPATCH = {
     "profit_payout": act_profit_payout,
     "profit_stats": act_profit_stats,
     "profit_history": act_profit_history,
+    "tx_view": act_tx_view,
+    "tx_edit_amt": act_tx_edit_amt,
+    "tx_edit_note": act_tx_edit_note,
+    "tx_flip": act_tx_flip,
+    "tx_del": act_tx_del,
+    "tx_del_yes": act_tx_del_yes,
     "profit_reset": act_profit_reset,
     "profit_edit": act_profit_edit,
     "clear_chat": act_clear_chat,
@@ -1120,7 +1183,10 @@ async def text_handler(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             ctx.user_data['na_bal'] = float(txt)
             if atype == 'CHALLENGE':
                 ctx.user_data['step'] = 3
-                await update.message.reply_text("Fee paid?", reply_markup=back_menu(ctx))
+                await update.message.reply_text(
+                    "Fee paid? (enter positive amount, e.g. 100 — it will be deducted from Bank Balance)",
+                    reply_markup=back_menu(ctx),
+                )
             else:
                 bal = ctx.user_data['na_bal']
                 acc = Account(user_id=u.id, name=ctx.user_data['na_name'], type='LIVE', start_balance=bal, current_balance=bal)
@@ -1130,7 +1196,16 @@ async def text_handler(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
                 ctx.user_data.clear()
                 await update.message.reply_text(f"✅ {acc.name} LIVE created", reply_markup=main_menu(update.effective_user.id))
         elif step == 3:
-            ctx.user_data['na_fee'] = float(txt)
+            fee = float(txt)
+            if fee < 0:
+                await update.message.reply_text(
+                    "⚠ Fee must be a positive number (e.g. 100).\n"
+                    "The bot will subtract it from your Bank Balance automatically.",
+                    reply_markup=back_menu(ctx),
+                )
+                s.close()
+                return
+            ctx.user_data['na_fee'] = fee
             rows = [[("10%", "cut", "10"), ("20%", "cut", "20")]]
             await update.message.reply_text("Prop cut %?", reply_markup=screen(ctx, rows))
     elif mode == 'withdraw':
@@ -1178,6 +1253,30 @@ async def text_handler(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         s.commit()
         ctx.user_data.clear()
         await update.message.reply_text(f"✅ {name} prop cut set to {val:.0f}%", reply_markup=main_menu(update.effective_user.id))
+    elif mode == 'tx_edit_amt':
+        try:
+            new_amt = float(txt.replace(',', '').replace('$', '').replace('+', ''))
+        except ValueError:
+            await update.message.reply_text("❌ Send a number like -103 or 250", reply_markup=back_wallet(ctx))
+            s.close()
+            return
+        tx = s.query(CashTx).get(ctx.user_data.get('tx_id'))
+        if tx:
+            tx.amount = new_amt
+            s.commit()
+        ctx.user_data.clear()
+        await update.message.reply_text(f"✅ Amount updated to {new_amt:+.2f}", reply_markup=main_menu(update.effective_user.id))
+        s.close()
+        return
+    elif mode == 'tx_edit_note':
+        tx = s.query(CashTx).get(ctx.user_data.get('tx_id'))
+        if tx:
+            tx.note = txt
+            s.commit()
+        ctx.user_data.clear()
+        await update.message.reply_text("✅ Note updated", reply_markup=main_menu(update.effective_user.id))
+        s.close()
+        return
     elif mode == 'pair_add':
         sym = txt.upper().replace("/", "")
         s.add(Pair(user_id=u.id, symbol=sym))
