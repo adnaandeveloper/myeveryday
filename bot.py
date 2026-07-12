@@ -2,8 +2,8 @@ import os
 from dotenv import load_dotenv
 load_dotenv()
 
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, ReplyKeyboardMarkup, KeyboardButton
-from telegram.ext import Application, CommandHandler, ContextTypes, CallbackQueryHandler, MessageHandler, filters
+from telegram import Update, ReplyKeyboardMarkup, KeyboardButton
+from telegram.ext import Application, CommandHandler, ContextTypes, MessageHandler, filters
 from sqlalchemy import create_engine, Column, String, Float, DateTime, ForeignKey, Text, UniqueConstraint, func, extract, text, inspect
 from sqlalchemy.orm import declarative_base, sessionmaker
 import uuid
@@ -115,7 +115,33 @@ def is_admin(tid):
     s.close()
     return u and u.is_admin == '1'
 
-def main_menu(uid=None):
+# ---------------------------------------------------------------------------
+# Reply keyboard helpers
+#
+# Every screen is rendered as a ReplyKeyboardMarkup. Because reply-keyboard
+# buttons only send their visible text (they carry no callback_data), each
+# screen also registers a per-screen navigation map in ctx.user_data['nav']
+# that maps the button label -> (action, argument). text_handler() resolves a
+# tapped button by looking it up in this map.
+# ---------------------------------------------------------------------------
+
+def rk(rows):
+    return ReplyKeyboardMarkup(rows, resize_keyboard=True)
+
+def screen(ctx, rows_spec):
+    """rows_spec: list of rows; each row is a list of (label, action, arg)."""
+    nav = {}
+    kb_rows = []
+    for row in rows_spec:
+        kb_row = []
+        for label, action, arg in row:
+            nav[label] = (action, arg)
+            kb_row.append(KeyboardButton(label))
+        kb_rows.append(kb_row)
+    ctx.user_data['nav'] = nav
+    return rk(kb_rows)
+
+def main_menu(tid=None):
     rows = [
         [KeyboardButton("📝 Log Trade"), KeyboardButton("✅ Close Trade")],
         [KeyboardButton("💰 Balance"), KeyboardButton("⚙ My Accounts")],
@@ -124,31 +150,27 @@ def main_menu(uid=None):
         [KeyboardButton("🖼 Gallery"), KeyboardButton("➕ Add Account")],
         [KeyboardButton("📏 My Rules"), KeyboardButton("💰 Wallet & Tools")],
     ]
-    if uid and is_admin(uid):
+    if tid and is_admin(tid):
         rows.append([KeyboardButton("👑 ADMIN PANEL")])
     return ReplyKeyboardMarkup(rows, resize_keyboard=True)
 
-def back_button():
-    return InlineKeyboardMarkup([[InlineKeyboardButton("⬅ Back to Menu", callback_data="back_main")]])
+def back_menu(ctx):
+    return screen(ctx, [[("⬅ Back to Menu", "main", None)]])
 
-def back_tools():
-    return InlineKeyboardMarkup([[InlineKeyboardButton("⬅ Back to Wallet", callback_data="menu_profit")]])
+def back_wallet(ctx):
+    return screen(ctx, [[("⬅ Back to Wallet", "wallet", None)]])
 
-def profit_menu():
-    return InlineKeyboardMarkup([
-        [InlineKeyboardButton("📉 Starting Balance", callback_data="profit_starting")],
-        [InlineKeyboardButton("💳 Challenge Buy", callback_data="profit_challenge"), InlineKeyboardButton("💰 Live Deposit", callback_data="profit_deposit")],
-        [InlineKeyboardButton("💸 Log Payout", callback_data="profit_payout"), InlineKeyboardButton("💵 Withdraw", callback_data="profit_withdraw")],
-        [InlineKeyboardButton("📊 View Stats", callback_data="profit_stats"), InlineKeyboardButton("🗑 Edit/Delete", callback_data="profit_edit")],
-        [InlineKeyboardButton("🔄 Reset All", callback_data="profit_reset"), InlineKeyboardButton("📜 Bank History", callback_data="profit_history")],
-        [InlineKeyboardButton("🧹 Clean View", callback_data="clear_chat")],
-        [InlineKeyboardButton("⬅ Back", callback_data="back_main")]
-    ])
+async def show_main(update, ctx):
+    ctx.user_data.clear()
+    await update.message.reply_text("💰 My Bank", reply_markup=main_menu(update.effective_user.id))
+
+# ---------------------------------------------------------------------------
+# Commands
+# ---------------------------------------------------------------------------
 
 async def start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     get_user(update.effective_user.id)
-    ctx.user_data.clear()
-    await update.message.reply_text("💰 My Bank", reply_markup=main_menu(update.effective_user.id))
+    await show_main(update, ctx)
 
 async def clear_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("🧹 Tap my name → Clear History")
@@ -156,368 +178,293 @@ async def clear_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 async def cmd_pairs(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     await txt_pairs(update, ctx)
 
-async def back_main(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    q = update.callback_query
-    await q.answer()
-    ctx.user_data.clear()
-    await q.message.reply_text("💰 My Bank", reply_markup=main_menu(q.from_user.id))
-    try:
-        await q.message.delete()
-    except:
-        pass
+# ---------------------------------------------------------------------------
+# Main menu screens (triggered by the persistent reply keyboard)
+# ---------------------------------------------------------------------------
 
-async def before_skip_cb(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    q = update.callback_query
-    await q.answer()
-    ctx.user_data.clear()
-    await q.edit_message_text("✅ Trade logged", reply_markup=main_menu(q.from_user.id))
-
-async def archive_acc(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    q = update.callback_query
-    await q.answer()
-    aid = q.data[5:]
+async def txt_log(update, ctx):
     s = Session()
-    a = s.query(Account).get(aid)
-    a.status = 'ARCHIVED'
-    s.commit()
-    s.close()
-    await q.edit_message_text(f"✅ {a.name} archived", reply_markup=back_button())
-
-async def wd_select(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    q = update.callback_query
-    await q.answer()
-    ctx.user_data['mode'] = 'withdraw'
-    ctx.user_data['wd_acc'] = q.data[3:]
-    await q.edit_message_text("Amount to withdraw to bank?", reply_markup=back_tools())
-
-async def payout_select(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    q = update.callback_query
-    await q.answer()
-    ctx.user_data['mode'] = 'payout'
-    ctx.user_data['payout_acc'] = q.data[7:]
-    await q.edit_message_text("Gross payout amount?", reply_markup=back_tools())
-
-async def deposit_select(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    q = update.callback_query
-    await q.answer()
-    ctx.user_data['mode'] = 'deposit'
-    ctx.user_data['deposit_acc'] = q.data[8:]
-    await q.edit_message_text("How much to deposit?", reply_markup=back_tools())
-
-async def menu_cb(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    q = update.callback_query
-    await q.answer()
-    d = q.data
-    ctx.user_data.clear()
-    s = Session()
-    u = get_user(q.from_user.id)
-    if d == "menu_log":
-        s.close()
-        return await trade_start(q, ctx)
-    if d == "menu_close":
-        s.close()
-        return await close_start(q, ctx)
-    if d == "menu_balance":
-        net = s.query(func.sum(CashTx.amount)).filter_by(user_id=u.id).scalar() or 0
-        s.close()
-        kb = [[InlineKeyboardButton("✏ Edit", callback_data="bal_edit"), InlineKeyboardButton("🔄 Reset", callback_data="bal_reset")], [InlineKeyboardButton("⬅ Back", callback_data="back_main")]]
-        await q.edit_message_text(f"💰 Bank Balance: ${net:.2f}", reply_markup=InlineKeyboardMarkup(kb))
-        return
-    if d == "bal_edit":
-        ctx.user_data['mode'] = 'bal_edit'
-        s.close()
-        await q.edit_message_text("Enter new bank balance:", reply_markup=back_button())
-        return
-    if d == "bal_reset":
-        s.close()
-        await q.edit_message_text("Reset bank to $0?", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("✅ Yes", callback_data="bal_reset_yes"), InlineKeyboardButton("❌ No", callback_data="menu_balance")]]))
-        return
-    if d == "bal_reset_yes":
-        s.query(CashTx).filter_by(user_id=u.id).delete()
-        s.commit()
-        s.close()
-        await q.edit_message_text("✅ Bank reset", reply_markup=back_button())
-        return
-    if d == "clear_chat":
-        s.close()
-        await q.edit_message_text("🧹 Tap my name → Clear History.", reply_markup=back_button())
-        return
-    if d == "menu_accounts":
-        accs = s.query(Account).filter_by(user_id=u.id, status='ACTIVE').all()
-        arch = s.query(Account).filter_by(user_id=u.id, status='ARCHIVED').all()
-        msg = "⚙ Active Accounts\n\n"
-        for a in accs:
-            cut = f" -{a.payout_cut}%" if a.type == 'CHALLENGE' else ""
-            msg += f"🟢 {a.name} ({a.type}{cut}) - ${a.current_balance:.0f}\n"
-        msg += "\n📦 Archived:\n"
-        for a in arch:
-            msg += f"• {a.name}\n"
-        kb = [[InlineKeyboardButton(f"📦 Archive {a.name}", callback_data=f"arch_{a.id}")] for a in accs]
-        kb.append([InlineKeyboardButton("⬅ Back", callback_data="back_main")])
-        s.close()
-        await q.edit_message_text(msg, reply_markup=InlineKeyboardMarkup(kb))
-        return
-    if d == "menu_add":
-        s.close()
-        await q.edit_message_text("Choose account type:", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("💼 Live", callback_data="add_live"), InlineKeyboardButton("🎯 Challenge", callback_data="add_challenge")], [InlineKeyboardButton("⬅ Back", callback_data="back_main")]]))
-        return
-    if d == "add_live":
-        ctx.user_data['mode'] = 'new_acc'
-        ctx.user_data['atype'] = 'LIVE'
-        ctx.user_data['step'] = 1
-        s.close()
-        await q.edit_message_text("Live account name?", reply_markup=back_button())
-        return
-    if d == "add_challenge":
-        ctx.user_data['mode'] = 'new_acc'
-        ctx.user_data['atype'] = 'CHALLENGE'
-        ctx.user_data['step'] = 1
-        s.close()
-        await q.edit_message_text("Challenge name? (e.g. FTMO 100k)", reply_markup=back_button())
-        return
-    if d == "menu_profit":
-        s.close()
-        await q.edit_message_text("💰 Wallet & Tools", reply_markup=profit_menu())
-        return
-    if d == "menu_pairs":
-        pairs = s.query(Pair).filter_by(user_id=u.id).all()
-        kb = [[InlineKeyboardButton(f"❌ {p.symbol}", callback_data=f"pairdel_{p.id}")] for p in pairs]
-        kb.append([InlineKeyboardButton("➕ Add Pair", callback_data="pair_add"), InlineKeyboardButton("⬅ Back", callback_data="back_main")])
-        s.close()
-        await q.edit_message_text("📈 My Pairs", reply_markup=InlineKeyboardMarkup(kb))
-        return
-    if d == "menu_analyse":
-        s.close()
-        return await txt_analyse(update, ctx)
-    s.close()
-
-async def profit_cb(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    q = update.callback_query
-    await q.answer()
-    d = q.data
-    s = Session()
-    u = get_user(q.from_user.id)
-    if d == "profit_starting":
-        init = s.query(func.sum(CashTx.amount)).filter_by(user_id=u.id, type='INITIAL').scalar() or 0
-        s.close()
-        ctx.user_data['mode'] = 'starting_balance'
-        await q.edit_message_text(f"📉 Current Starting Balance: ${init:+.2f}\n\nSend your REAL P/L before using this bot.\n\nExamples:\n-10000 -> you lost 10k\n0 -> fresh start\n3500 -> you were up 3.5k\n\nJust send the number:", reply_markup=back_tools())
-        return
-    if d == "profit_withdraw":
-        accs = s.query(Account).filter_by(user_id=u.id, status='ACTIVE').all()
-        kb = [[InlineKeyboardButton(a.name, callback_data=f"wd_{a.id}")] for a in accs]
-        kb.append([InlineKeyboardButton("⬅ Back", callback_data="menu_profit")])
-        await q.edit_message_text("Select account to withdraw FROM:", reply_markup=InlineKeyboardMarkup(kb))
-    elif d == "profit_challenge":
-        ctx.user_data['mode'] = 'quick'
-        ctx.user_data['qt'] = 'challenge'
-        await q.edit_message_text("Send: NAME BALANCE FEE", reply_markup=back_tools())
-    elif d == "profit_deposit":
-        accs = s.query(Account).filter_by(user_id=u.id, status='ACTIVE', type='LIVE').all()
-        kb = [[InlineKeyboardButton(a.name, callback_data=f"deposit_{a.id}")] for a in accs]
-        kb.append([InlineKeyboardButton("⬅ Back", callback_data="menu_profit")])
-        await q.edit_message_text("Deposit to which LIVE account?", reply_markup=InlineKeyboardMarkup(kb))
-    elif d == "profit_payout":
-        accs = s.query(Account).filter_by(user_id=u.id, status='ACTIVE').all()
-        kb = [[InlineKeyboardButton(f"{a.name} ({a.type})", callback_data=f"payout_{a.id}")] for a in accs]
-        kb.append([InlineKeyboardButton("⬅ Back", callback_data="menu_profit")])
-        await q.edit_message_text("Payout from which account?", reply_markup=InlineKeyboardMarkup(kb))
-    elif d == "profit_stats":
-        fees = s.query(func.sum(CashTx.amount)).filter_by(user_id=u.id, type='FEE').scalar() or 0
-        deposits = s.query(func.sum(CashTx.amount)).filter_by(user_id=u.id, type='DEPOSIT').scalar() or 0
-        payouts = s.query(func.sum(CashTx.amount)).filter_by(user_id=u.id, type='PAYOUT').scalar() or 0
-        withdraws = s.query(func.sum(CashTx.amount)).filter_by(user_id=u.id, type='WITHDRAW').scalar() or 0
-        initial = s.query(func.sum(CashTx.amount)).filter_by(user_id=u.id, type='INITIAL').scalar() or 0
-        net = s.query(func.sum(CashTx.amount)).filter_by(user_id=u.id).scalar() or 0
-        await q.edit_message_text(f"📊 Stats\nStarting (Old): ${initial:+.2f}\nFees: ${abs(fees):.2f}\nLive Capital: ${abs(deposits):.2f}\nPayouts: ${payouts:.2f}\nWithdraws: ${abs(withdraws):.2f}\n-----------------\nNet Real: ${net:.2f}", reply_markup=back_tools())
-    elif d == "profit_history":
-        txs = s.query(CashTx).filter_by(user_id=u.id).order_by(CashTx.date.desc()).limit(20).all()
-        msg = "📜 Bank History\n\n"
-        for t in txs:
-            msg += f"{t.date.strftime('%d/%m/%Y')} {t.type} ${t.amount:+.2f} - {t.note}\n"
-        await q.edit_message_text(msg or "No transactions", reply_markup=back_tools())
-    elif d == "profit_reset":
-        await q.edit_message_text("Delete ALL data?", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("✅ YES", callback_data="reset_yes"), InlineKeyboardButton("❌ No", callback_data="menu_profit")]]))
-    elif d == "profit_edit":
-        accs = s.query(Account).filter_by(user_id=u.id).all()
-        kb = [[InlineKeyboardButton(f"🗑 {a.name}", callback_data=f"delacc_{a.id}")] for a in accs]
-        kb.append([InlineKeyboardButton("⬅ Back", callback_data="menu_profit")])
-        await q.edit_message_text("Delete account:", reply_markup=InlineKeyboardMarkup(kb))
-    s.close()
-
-async def reset_yes(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    q = update.callback_query
-    await q.answer()
-    s = Session()
-    u = get_user(q.from_user.id)
-    uid = u.id
-    s.query(TradeAccount).filter(TradeAccount.trade_id.in_(s.query(Trade.id).filter_by(user_id=uid))).delete(synchronize_session=False)
-    s.query(Trade).filter_by(user_id=uid).delete()
-    s.query(Account).filter_by(user_id=uid).delete()
-    s.query(Pair).filter_by(user_id=uid).delete()
-    s.query(CashTx).filter_by(user_id=uid).delete()
-    s.query(Rule).filter_by(user_id=uid).delete()
-    s.commit()
-    s.close()
-    await q.edit_message_text("✅ Reset done", reply_markup=back_button())
-
-async def trade_start(q, ctx):
-    s = Session()
-    u = get_user(q.from_user.id)
+    u = get_user(update.effective_user.id)
     accs = s.query(Account).filter_by(user_id=u.id, status='ACTIVE').all()
     s.close()
+    if not accs:
+        await update.message.reply_text("⚠ No active accounts. Add one first.", reply_markup=main_menu(update.effective_user.id))
+        return
     ctx.user_data['mode'] = 'trade'
     ctx.user_data['trade'] = {}
-    kb = [[InlineKeyboardButton(a.name, callback_data=f"ta_{a.id}")] for a in accs]
-    kb.append([InlineKeyboardButton("All Accounts", callback_data="ta_all")])
-    kb.append([InlineKeyboardButton("⬅ Back", callback_data="back_main")])
-    await q.edit_message_text("Select account:", reply_markup=InlineKeyboardMarkup(kb))
+    rows = [[(a.name, "trade_acc", a.id)] for a in accs]
+    rows.append([("All Accounts", "trade_acc", "all")])
+    rows.append([("⬅ Back to Menu", "main", None)])
+    await update.message.reply_text("Select account:", reply_markup=screen(ctx, rows))
 
-async def trade_acc_cb(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    q = update.callback_query
-    await q.answer()
+async def txt_close(update, ctx):
     s = Session()
-    u = get_user(q.from_user.id)
-    if q.data == "ta_all":
+    u = get_user(update.effective_user.id)
+    trs = s.query(Trade).filter_by(user_id=u.id, closed_at=None).all()
+    s.close()
+    if not trs:
+        await update.message.reply_text("No open trades", reply_markup=main_menu(update.effective_user.id))
+        return
+    ctx.user_data.pop('mode', None)
+    rows = [[(f"{i+1}. {t.symbol} {t.direction}", "close_trade", t.id)] for i, t in enumerate(trs)]
+    rows.append([("⬅ Back to Menu", "main", None)])
+    await update.message.reply_text("Select trade to close:", reply_markup=screen(ctx, rows))
+
+async def txt_balance(update, ctx):
+    s = Session()
+    u = get_user(update.effective_user.id)
+    net = s.query(func.sum(CashTx.amount)).filter_by(user_id=u.id).scalar() or 0
+    s.close()
+    ctx.user_data.pop('mode', None)
+    rows = [[("✏ Edit", "bal_edit", None), ("🔄 Reset", "bal_reset", None)],
+            [("⬅ Back to Menu", "main", None)]]
+    await update.message.reply_text(f"💰 Bank Balance: ${net:.2f}", reply_markup=screen(ctx, rows))
+
+async def txt_accounts(update, ctx):
+    s = Session()
+    u = get_user(update.effective_user.id)
+    accs = s.query(Account).filter_by(user_id=u.id, status='ACTIVE').all()
+    arch = s.query(Account).filter_by(user_id=u.id, status='ARCHIVED').all()
+    msg = "⚙ Active Accounts\n\n"
+    for a in accs:
+        cut = f" -{a.payout_cut}%" if a.type == 'CHALLENGE' else ""
+        msg += f"🟢 {a.name} ({a.type}{cut}) - ${a.current_balance:.0f}\n"
+    msg += "\n📦 Archived:\n"
+    for a in arch:
+        msg += f"• {a.name}\n"
+    rows = [[(f"📦 Archive {a.name}", "archive", a.id)] for a in accs]
+    rows.append([("⬅ Back to Menu", "main", None)])
+    s.close()
+    ctx.user_data.pop('mode', None)
+    await update.message.reply_text(msg, reply_markup=screen(ctx, rows))
+
+async def txt_analyse(update, ctx):
+    ctx.user_data.pop('mode', None)
+    rows = [
+        [("📅 Today", "analyse", "today"), ("📆 This Week", "analyse", "week")],
+        [("🗓 This Month", "analyse", "month"), ("📆 Last Month", "analyse", "lastmonth")],
+        [("📈 This Year", "analyse", "year"), ("🌍 All Time", "analyse", "all")],
+        [("⬅ Back to Menu", "main", None)],
+    ]
+    await update.message.reply_text("📊 Analyse - Choose period", reply_markup=screen(ctx, rows))
+
+async def txt_journal(update, ctx):
+    s = Session()
+    u = get_user(update.effective_user.id)
+    trades = s.query(Trade).filter_by(user_id=u.id).order_by(Trade.opened_at.desc()).all()
+    s.close()
+    months = {}
+    for t in trades:
+        key = (t.opened_at.year, t.opened_at.month)
+        months[key] = months.get(key, 0) + 1
+    if not months:
+        await update.message.reply_text("📖 No trades yet", reply_markup=back_menu(ctx))
+        return
+    ctx.user_data.pop('mode', None)
+    rows = []
+    for (year, month), count in sorted(months.items(), reverse=True):
+        month_name = calendar.month_name[month]
+        rows.append([(f"{month_name} {year} ({count} trades)", "journal_month", (year, month))])
+    rows.append([("⬅ Back to Menu", "main", None)])
+    await update.message.reply_text("📖 Journal - Select Month", reply_markup=screen(ctx, rows))
+
+async def txt_pairs(update, ctx):
+    s = Session()
+    u = get_user(update.effective_user.id)
+    pairs = s.query(Pair).filter_by(user_id=u.id).all()
+    s.close()
+    ctx.user_data.pop('mode', None)
+    rows = [[(f"❌ {p.symbol}", "pairdel", p.id)] for p in pairs]
+    rows.append([("➕ Add Pair", "pair_add", None)])
+    rows.append([("⬅ Back to Menu", "main", None)])
+    await update.message.reply_text("📈 My Pairs", reply_markup=screen(ctx, rows))
+
+async def txt_hist(update, ctx):
+    s = Session()
+    u = get_user(update.effective_user.id)
+    tas = s.query(TradeAccount).join(Trade).filter(Trade.user_id == u.id).filter(TradeAccount.closed_at != None).order_by(TradeAccount.closed_at.desc()).limit(20).all()
+    msg = "📜 Trade History\n\n"
+    for ta in tas:
+        tr = s.query(Trade).get(ta.trade_id)
+        acc = s.query(Account).get(ta.account_id)
+        if tr and ta.pnl_usd is not None:
+            msg += f"{tr.opened_at.strftime('%d %b %Y')} {tr.symbol} {ta.result or ''} ${ta.pnl_usd:+.0f} ({acc.name})\n"
+    s.close()
+    ctx.user_data.pop('mode', None)
+    await update.message.reply_text(msg or "No history yet", reply_markup=back_menu(ctx))
+
+async def txt_gallery(update, ctx):
+    ctx.user_data.pop('mode', None)
+    rows = [
+        [("📅 Today", "gallery", "today"), ("📆 This Week", "gallery", "week")],
+        [("🗓 This Month", "gallery", "month"), ("📈 This Year", "gallery", "year")],
+        [("🌍 All Trades", "gallery", "all")],
+        [("⬅ Back to Menu", "main", None)],
+    ]
+    await update.message.reply_text("🖼 Gallery - Choose period", reply_markup=screen(ctx, rows))
+
+async def txt_add(update, ctx):
+    ctx.user_data.pop('mode', None)
+    rows = [[("💼 Live", "add_live", None), ("🎯 Challenge", "add_challenge", None)],
+            [("⬅ Back to Menu", "main", None)]]
+    await update.message.reply_text("Choose type:", reply_markup=screen(ctx, rows))
+
+async def txt_profit(update, ctx):
+    await show_wallet(update, ctx)
+
+async def txt_admin(update, ctx):
+    ctx.user_data.pop('mode', None)
+    rows = [[("👥 Users", "admin_users", None)], [("⬅ Back to Menu", "main", None)]]
+    await update.message.reply_text("👑 ADMIN", reply_markup=screen(ctx, rows))
+
+async def txt_rules(update, ctx):
+    await show_rules(update, ctx)
+
+# ---------------------------------------------------------------------------
+# Wallet & Tools
+# ---------------------------------------------------------------------------
+
+async def show_wallet(update, ctx):
+    ctx.user_data.pop('mode', None)
+    rows = [
+        [("📉 Starting Balance", "profit_starting", None)],
+        [("💳 Challenge Buy", "profit_challenge", None), ("💰 Live Deposit", "profit_deposit", None)],
+        [("💸 Log Payout", "profit_payout", None), ("💵 Withdraw", "profit_withdraw", None)],
+        [("📊 View Stats", "profit_stats", None), ("🗑 Edit/Delete", "profit_edit", None)],
+        [("🔄 Reset All", "profit_reset", None), ("📜 Bank History", "profit_history", None)],
+        [("🧹 Clean View", "clear_chat", None)],
+        [("⬅ Back to Menu", "main", None)],
+    ]
+    await update.message.reply_text("💰 Wallet & Tools", reply_markup=screen(ctx, rows))
+
+async def show_rules(update, ctx):
+    s = Session()
+    u = get_user(update.effective_user.id)
+    rules = s.query(Rule).filter_by(user_id=u.id).order_by(Rule.order_num, Rule.created_at).all()
+    s.close()
+    if not rules:
+        msg = "📏 My Rules\n\nNo rules yet."
+    else:
+        msg = "📏 My Rules\n\n" + "\n\n".join([f"{i}. {r.text}" for i, r in enumerate(rules, 1)])
+    ctx.user_data.pop('mode', None)
+    rows = []
+    for i, r in enumerate(rules, 1):
+        rows.append([(f"✏ {i}", "rule_edit", r.id), (f"🗑 {i}", "rule_del", r.id)])
+    rows.append([("➕ Add Rule", "rule_add", None)])
+    rows.append([("⬅ Back to Menu", "main", None)])
+    await update.message.reply_text(msg, reply_markup=screen(ctx, rows))
+
+# ---------------------------------------------------------------------------
+# Trade logging flow
+# ---------------------------------------------------------------------------
+
+async def act_trade_acc(update, ctx, arg):
+    s = Session()
+    u = get_user(update.effective_user.id)
+    if arg == "all":
         accs = s.query(Account).filter_by(user_id=u.id, status='ACTIVE').all()
         acc_ids = [a.id for a in accs]
     else:
-        acc_ids = [q.data[3:]]
+        acc_ids = [arg]
+    ctx.user_data.setdefault('trade', {})
     ctx.user_data['trade']['acc_ids'] = acc_ids
     pairs = s.query(Pair).filter_by(user_id=u.id).all()
     s.close()
-    kb = [[InlineKeyboardButton(p.symbol, callback_data=f"tp_{p.symbol}")] for p in pairs]
-    kb.append([InlineKeyboardButton("⬅ Back", callback_data="back_main")])
-    await q.edit_message_text("Select pair:", reply_markup=InlineKeyboardMarkup(kb))
+    rows = [[(p.symbol, "trade_pair", p.symbol)] for p in pairs]
+    rows.append([("⬅ Back to Menu", "main", None)])
+    await update.message.reply_text("Select pair:", reply_markup=screen(ctx, rows))
 
-async def trade_pair_cb(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    q = update.callback_query
-    await q.answer()
-    ctx.user_data['trade']['symbol'] = q.data[3:]
-    await q.edit_message_text("LONG or SHORT?", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("LONG 📈", callback_data="dir_LONG"), InlineKeyboardButton("SHORT 📉", callback_data="dir_SHORT")]]))
+async def act_trade_pair(update, ctx, arg):
+    ctx.user_data.setdefault('trade', {})
+    ctx.user_data['trade']['symbol'] = arg
+    rows = [[("LONG 📈", "dir", "LONG"), ("SHORT 📉", "dir", "SHORT")],
+            [("⬅ Back to Menu", "main", None)]]
+    await update.message.reply_text("LONG or SHORT?", reply_markup=screen(ctx, rows))
 
-async def dir_cb(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    q = update.callback_query
-    await q.answer()
-    ctx.user_data['trade']['direction'] = q.data.split('_')[1]
+async def act_dir(update, ctx, arg):
+    ctx.user_data.setdefault('trade', {})
+    ctx.user_data['trade']['direction'] = arg
     ctx.user_data['trade']['step'] = 'photo'
-    await q.edit_message_text("Send BEFORE photo", reply_markup=back_button())
+    await update.message.reply_text("Send BEFORE photo", reply_markup=back_menu(ctx))
 
-async def cut_cb(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    q = update.callback_query
-    await q.answer()
-    cut = float(q.data.split('_')[1])
-    s = Session()
-    u = get_user(q.from_user.id)
-    bal = ctx.user_data['na_bal']
-    fee = ctx.user_data['na_fee']
-    name = ctx.user_data['na_name']
-    acc = Account(user_id=u.id, name=name, type='CHALLENGE', start_balance=bal, current_balance=bal, fee_paid=fee, payout_cut=cut)
-    s.add(acc)
-    s.add(CashTx(user_id=u.id, type='FEE', amount=-fee, note=f"Buy {name}"))
-    s.commit()
-    s.close()
-    ctx.user_data.clear()
-    await q.edit_message_text(f"✅ {name} CHALLENGE created\nFee: ${fee} | Prop cut: {cut}%", reply_markup=main_menu(q.from_user.id))
+# ---------------------------------------------------------------------------
+# Close trade flow
+# ---------------------------------------------------------------------------
 
-async def close_start(q, ctx):
-    s = Session()
-    u = get_user(q.from_user.id)
-    trs = s.query(Trade).filter_by(user_id=u.id, closed_at=None).all()
-    s.close()
-    kb = [[InlineKeyboardButton(f"{t.symbol} {t.direction}", callback_data=f"tc_{t.id}")] for t in trs]
-    kb.append([InlineKeyboardButton("⬅ Back", callback_data="back_main")])
-    await q.edit_message_text("Select trade to close:", reply_markup=InlineKeyboardMarkup(kb))
-
-async def close_cb(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    q = update.callback_query
-    await q.answer()
+async def act_close_trade(update, ctx, arg):
     ctx.user_data['mode'] = 'close'
-    ctx.user_data['close'] = {'id': q.data[3:], 'step': 'photo'}
-    await q.edit_message_text("Send AFTER photo", reply_markup=back_button())
+    ctx.user_data['close'] = {'id': arg, 'step': 'photo'}
+    await update.message.reply_text("Send AFTER photo", reply_markup=back_menu(ctx))
 
-async def close_res_cb(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    q = update.callback_query
-    await q.answer()
+async def act_close_res(update, ctx, arg):
     try:
-        res = q.data.split('_')[1]
+        res = arg
         if 'close' not in ctx.user_data:
             ctx.user_data['close'] = {}
         ctx.user_data['close']['result'] = res
         if 'id' not in ctx.user_data['close']:
-            await q.edit_message_text("⚠ Session expired. Please select Close Trade again.", reply_markup=back_button())
+            await update.message.reply_text("⚠ Session expired. Please select Close Trade again.", reply_markup=back_menu(ctx))
             return
         tid = ctx.user_data['close']['id']
         s = Session()
         tas = s.query(TradeAccount).filter_by(trade_id=tid).all()
         s.close()
         if not tas:
-            await q.edit_message_text("❌ No accounts linked.", reply_markup=back_button())
+            await update.message.reply_text("❌ No accounts linked.", reply_markup=back_menu(ctx))
             return
         ctx.user_data['close']['tas'] = {ta.account_id: ta.pnl_usd for ta in tas}
-        await show_close_accounts_menu(q, ctx)
+        await show_close_accounts_menu(update, ctx)
     except Exception as e:
-        await q.edit_message_text(f"Error: {e}", reply_markup=back_button())
+        await update.message.reply_text(f"Error: {e}", reply_markup=back_menu(ctx))
 
-async def show_close_accounts_menu(q_or_update, ctx):
-    tid = ctx.user_data['close']['id']
+async def show_close_accounts_menu(update, ctx):
     res = ctx.user_data['close']['result']
     acc_pnls = ctx.user_data['close']['tas']
     s = Session()
-    kb = []
+    rows = []
     all_done = True
-    ctx.user_data['close']['map'] = {}
-    for i, (acc_id, pnl) in enumerate(acc_pnls.items()):
+    for acc_id, pnl in acc_pnls.items():
         acc = s.query(Account).get(acc_id)
         if not acc:
             continue
-        code = f"c{i}"
-        ctx.user_data['close']['map'][code] = acc_id
         if pnl is None:
-            kb.append([InlineKeyboardButton(f"[ ] {acc.name}", callback_data=f"closeacc_{code}")])
+            rows.append([(f"[ ] {acc.name}", "closeacc", acc_id)])
             all_done = False
         else:
-            kb.append([InlineKeyboardButton(f"[✅ ${pnl:+.0f}] {acc.name}", callback_data=f"closeacc_{code}")])
+            rows.append([(f"[✅ ${pnl:+.0f}] {acc.name}", "closeacc", acc_id)])
     if all_done:
-        kb.append([InlineKeyboardButton("✅ DONE - Add Comment", callback_data="closeacc_done")])
+        rows.append([("✅ DONE - Add Comment", "closeacc_done", None)])
     else:
-        kb.append([InlineKeyboardButton("⬅ Back", callback_data="back_main")])
+        rows.append([("⬅ Back to Menu", "main", None)])
     s.close()
-    text = f"{res} hit. Tap each account:"
-    if isinstance(q_or_update, Update):
-        await q_or_update.message.reply_text(text, reply_markup=InlineKeyboardMarkup(kb))
-    else:
-        await q_or_update.edit_message_text(text, reply_markup=InlineKeyboardMarkup(kb))
+    ctx.user_data['mode'] = 'close'
+    await update.message.reply_text(f"{res} hit. Tap each account:", reply_markup=screen(ctx, rows))
 
-async def close_acc_select(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    q = update.callback_query
-    await q.answer()
-    data = q.data
-    if data == "closeacc_done":
-        ctx.user_data['mode'] = 'await_comment'
-        await q.edit_message_text("✍ Add closing note? (optional)", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("⏭ Skip", callback_data="comment_skip")]]))
-        return
-    code = data.split('_')[1]
-    acc_id = ctx.user_data['close']['map'][code]
+async def act_closeacc(update, ctx, arg):
+    acc_id = arg
     ctx.user_data['mode'] = 'close_pnl'
     ctx.user_data['close']['current_acc'] = acc_id
     s = Session()
     acc = s.query(Account).get(acc_id)
     s.close()
-    await q.edit_message_text(f"Enter PnL for {acc.name} (use -50 or +120):\nCurrent: ${acc.current_balance:.2f}", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("⬅ Back", callback_data="closeacc_back")]]))
+    rows = [[("⬅ Back", "closeacc_back", None)]]
+    await update.message.reply_text(
+        f"Enter PnL for {acc.name} (use -50 or +120):\nCurrent: ${acc.current_balance:.2f}",
+        reply_markup=screen(ctx, rows))
 
-async def close_acc_back(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    q = update.callback_query
-    await q.answer()
+async def act_closeacc_back(update, ctx, arg):
     ctx.user_data['mode'] = 'close'
-    await show_close_accounts_menu(q, ctx)
+    await show_close_accounts_menu(update, ctx)
 
-async def comment_skip_cb(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    q = update.callback_query
-    await q.answer()
-    await finalize_trade(q, ctx, None)
+async def act_closeacc_done(update, ctx, arg):
+    ctx.user_data['mode'] = 'await_comment'
+    rows = [[("⏭ Skip", "comment_skip", None)]]
+    await update.message.reply_text("✍ Add closing note? (optional)", reply_markup=screen(ctx, rows))
 
-async def finalize_trade(src, ctx, comment):
+async def act_comment_skip(update, ctx, arg):
+    await finalize_trade(update, ctx, None)
+
+async def finalize_trade(update, ctx, comment):
     tid = ctx.user_data['close']['id']
     s = Session()
     tr = s.query(Trade).get(tid)
@@ -532,62 +479,270 @@ async def finalize_trade(src, ctx, comment):
         acc.current_balance += pnl
     s.commit()
     s.close()
-    if hasattr(src, 'from_user'):
-        chat = src.message
-        user_id = src.from_user.id
-    else:
-        chat = src.effective_message
-        user_id = src.effective_user.id
+    user_id = update.effective_user.id
     ctx.user_data.clear()
     txt = "✅ Trade closed"
     if comment:
         txt += f"\n💬 {comment}"
-    await chat.reply_text(txt, reply_markup=main_menu(user_id))
+    await update.message.reply_text(txt, reply_markup=main_menu(user_id))
 
-async def journal_month_cb(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    q = update.callback_query
-    await q.answer()
-    if 'last_photos' in ctx.user_data:
-        for msg_id in ctx.user_data['last_photos']:
-            try:
-                await q.message.chat.delete_message(msg_id)
-            except:
-                pass
-        ctx.user_data.pop('last_photos')
-    _, year, month = q.data.split('_')
-    year, month = int(year), int(month)
+# ---------------------------------------------------------------------------
+# Wallet actions
+# ---------------------------------------------------------------------------
+
+async def act_profit_starting(update, ctx, arg):
     s = Session()
-    u = get_user(q.from_user.id)
+    u = get_user(update.effective_user.id)
+    init = s.query(func.sum(CashTx.amount)).filter_by(user_id=u.id, type='INITIAL').scalar() or 0
+    s.close()
+    ctx.user_data['mode'] = 'starting_balance'
+    await update.message.reply_text(
+        f"📉 Current Starting Balance: ${init:+.2f}\n\nSend your REAL P/L before using this bot.\n\nExamples:\n-10000 -> you lost 10k\n0 -> fresh start\n3500 -> you were up 3.5k\n\nJust send the number:",
+        reply_markup=back_wallet(ctx))
+
+async def act_profit_challenge(update, ctx, arg):
+    ctx.user_data['mode'] = 'quick'
+    ctx.user_data['qt'] = 'challenge'
+    await update.message.reply_text("Send: NAME BALANCE FEE", reply_markup=back_wallet(ctx))
+
+async def act_profit_deposit(update, ctx, arg):
+    s = Session()
+    u = get_user(update.effective_user.id)
+    accs = s.query(Account).filter_by(user_id=u.id, status='ACTIVE', type='LIVE').all()
+    s.close()
+    rows = [[(a.name, "deposit_pick", a.id)] for a in accs]
+    rows.append([("⬅ Back to Wallet", "wallet", None)])
+    await update.message.reply_text("Deposit to which LIVE account?", reply_markup=screen(ctx, rows))
+
+async def act_profit_withdraw(update, ctx, arg):
+    s = Session()
+    u = get_user(update.effective_user.id)
+    accs = s.query(Account).filter_by(user_id=u.id, status='ACTIVE').all()
+    s.close()
+    rows = [[(a.name, "wd_pick", a.id)] for a in accs]
+    rows.append([("⬅ Back to Wallet", "wallet", None)])
+    await update.message.reply_text("Select account to withdraw FROM:", reply_markup=screen(ctx, rows))
+
+async def act_profit_payout(update, ctx, arg):
+    s = Session()
+    u = get_user(update.effective_user.id)
+    accs = s.query(Account).filter_by(user_id=u.id, status='ACTIVE').all()
+    s.close()
+    rows = [[(f"{a.name} ({a.type})", "payout_pick", a.id)] for a in accs]
+    rows.append([("⬅ Back to Wallet", "wallet", None)])
+    await update.message.reply_text("Payout from which account?", reply_markup=screen(ctx, rows))
+
+async def act_profit_stats(update, ctx, arg):
+    s = Session()
+    u = get_user(update.effective_user.id)
+    fees = s.query(func.sum(CashTx.amount)).filter_by(user_id=u.id, type='FEE').scalar() or 0
+    deposits = s.query(func.sum(CashTx.amount)).filter_by(user_id=u.id, type='DEPOSIT').scalar() or 0
+    payouts = s.query(func.sum(CashTx.amount)).filter_by(user_id=u.id, type='PAYOUT').scalar() or 0
+    withdraws = s.query(func.sum(CashTx.amount)).filter_by(user_id=u.id, type='WITHDRAW').scalar() or 0
+    initial = s.query(func.sum(CashTx.amount)).filter_by(user_id=u.id, type='INITIAL').scalar() or 0
+    net = s.query(func.sum(CashTx.amount)).filter_by(user_id=u.id).scalar() or 0
+    s.close()
+    await update.message.reply_text(
+        f"📊 Stats\nStarting (Old): ${initial:+.2f}\nFees: ${abs(fees):.2f}\nLive Capital: ${abs(deposits):.2f}\nPayouts: ${payouts:.2f}\nWithdraws: ${abs(withdraws):.2f}\n-----------------\nNet Real: ${net:.2f}",
+        reply_markup=back_wallet(ctx))
+
+async def act_profit_history(update, ctx, arg):
+    s = Session()
+    u = get_user(update.effective_user.id)
+    txs = s.query(CashTx).filter_by(user_id=u.id).order_by(CashTx.date.desc()).limit(20).all()
+    msg = "📜 Bank History\n\n"
+    for t in txs:
+        msg += f"{t.date.strftime('%d/%m/%Y')} {t.type} ${t.amount:+.2f} - {t.note}\n"
+    s.close()
+    await update.message.reply_text(msg or "No transactions", reply_markup=back_wallet(ctx))
+
+async def act_profit_reset(update, ctx, arg):
+    rows = [[("✅ YES", "reset_yes", None), ("❌ No", "wallet", None)]]
+    await update.message.reply_text("Delete ALL data?", reply_markup=screen(ctx, rows))
+
+async def act_profit_edit(update, ctx, arg):
+    s = Session()
+    u = get_user(update.effective_user.id)
+    accs = s.query(Account).filter_by(user_id=u.id).all()
+    s.close()
+    rows = [[(f"🗑 {a.name}", "delacc", a.id)] for a in accs]
+    rows.append([("⬅ Back to Wallet", "wallet", None)])
+    await update.message.reply_text("Delete account:", reply_markup=screen(ctx, rows))
+
+async def act_clear_chat(update, ctx, arg):
+    await update.message.reply_text("🧹 Tap my name → Clear History.", reply_markup=back_menu(ctx))
+
+async def act_reset_yes(update, ctx, arg):
+    s = Session()
+    u = get_user(update.effective_user.id)
+    uid_ = u.id
+    s.query(TradeAccount).filter(TradeAccount.trade_id.in_(s.query(Trade.id).filter_by(user_id=uid_))).delete(synchronize_session=False)
+    s.query(Trade).filter_by(user_id=uid_).delete()
+    s.query(Account).filter_by(user_id=uid_).delete()
+    s.query(Pair).filter_by(user_id=uid_).delete()
+    s.query(CashTx).filter_by(user_id=uid_).delete()
+    s.query(Rule).filter_by(user_id=uid_).delete()
+    s.commit()
+    s.close()
+    ctx.user_data.clear()
+    await update.message.reply_text("✅ Reset done", reply_markup=back_menu(ctx))
+
+async def act_wd_pick(update, ctx, arg):
+    ctx.user_data['mode'] = 'withdraw'
+    ctx.user_data['wd_acc'] = arg
+    await update.message.reply_text("Amount to withdraw to bank?", reply_markup=back_wallet(ctx))
+
+async def act_payout_pick(update, ctx, arg):
+    ctx.user_data['mode'] = 'payout'
+    ctx.user_data['payout_acc'] = arg
+    await update.message.reply_text("Gross payout amount?", reply_markup=back_wallet(ctx))
+
+async def act_deposit_pick(update, ctx, arg):
+    ctx.user_data['mode'] = 'deposit'
+    ctx.user_data['deposit_acc'] = arg
+    await update.message.reply_text("How much to deposit?", reply_markup=back_wallet(ctx))
+
+# ---------------------------------------------------------------------------
+# Balance actions
+# ---------------------------------------------------------------------------
+
+async def act_bal_edit(update, ctx, arg):
+    ctx.user_data['mode'] = 'bal_edit'
+    await update.message.reply_text("Enter new bank balance:", reply_markup=back_menu(ctx))
+
+async def act_bal_reset(update, ctx, arg):
+    rows = [[("✅ Yes", "bal_reset_yes", None), ("❌ No", "balance_menu", None)]]
+    await update.message.reply_text("Reset bank to $0?", reply_markup=screen(ctx, rows))
+
+async def act_bal_reset_yes(update, ctx, arg):
+    s = Session()
+    u = get_user(update.effective_user.id)
+    s.query(CashTx).filter_by(user_id=u.id).delete()
+    s.commit()
+    s.close()
+    await update.message.reply_text("✅ Bank reset", reply_markup=back_menu(ctx))
+
+async def act_balance_menu(update, ctx, arg):
+    await txt_balance(update, ctx)
+
+# ---------------------------------------------------------------------------
+# Account create / archive / delete / pairs
+# ---------------------------------------------------------------------------
+
+async def act_add_live(update, ctx, arg):
+    ctx.user_data['mode'] = 'new_acc'
+    ctx.user_data['atype'] = 'LIVE'
+    ctx.user_data['step'] = 1
+    await update.message.reply_text("Live account name?", reply_markup=back_menu(ctx))
+
+async def act_add_challenge(update, ctx, arg):
+    ctx.user_data['mode'] = 'new_acc'
+    ctx.user_data['atype'] = 'CHALLENGE'
+    ctx.user_data['step'] = 1
+    await update.message.reply_text("Challenge name? (e.g. FTMO 100k)", reply_markup=back_menu(ctx))
+
+async def act_cut(update, ctx, arg):
+    cut = float(arg)
+    s = Session()
+    u = get_user(update.effective_user.id)
+    bal = ctx.user_data['na_bal']
+    fee = ctx.user_data['na_fee']
+    name = ctx.user_data['na_name']
+    acc = Account(user_id=u.id, name=name, type='CHALLENGE', start_balance=bal, current_balance=bal, fee_paid=fee, payout_cut=cut)
+    s.add(acc)
+    s.add(CashTx(user_id=u.id, type='FEE', amount=-fee, note=f"Buy {name}"))
+    s.commit()
+    s.close()
+    ctx.user_data.clear()
+    await update.message.reply_text(f"✅ {name} CHALLENGE created\nFee: ${fee} | Prop cut: {cut}%", reply_markup=main_menu(update.effective_user.id))
+
+async def act_archive(update, ctx, arg):
+    s = Session()
+    a = s.query(Account).get(arg)
+    a.status = 'ARCHIVED'
+    name = a.name
+    s.commit()
+    s.close()
+    await update.message.reply_text(f"✅ {name} archived", reply_markup=back_menu(ctx))
+
+async def act_delacc(update, ctx, arg):
+    s = Session()
+    s.query(Account).filter_by(id=arg).delete()
+    s.commit()
+    s.close()
+    await update.message.reply_text("✅ Account deleted", reply_markup=back_menu(ctx))
+
+async def act_pair_add(update, ctx, arg):
+    ctx.user_data['mode'] = 'pair_add'
+    await update.message.reply_text("Send pair symbol (e.g. EURUSD)", reply_markup=back_menu(ctx))
+
+async def act_pairdel(update, ctx, arg):
+    s = Session()
+    s.query(Pair).filter_by(id=arg).delete()
+    s.commit()
+    s.close()
+    await update.message.reply_text("✅ Pair deleted", reply_markup=back_menu(ctx))
+
+# ---------------------------------------------------------------------------
+# Rules actions
+# ---------------------------------------------------------------------------
+
+async def act_rule_add(update, ctx, arg):
+    ctx.user_data['mode'] = 'rule_add'
+    await update.message.reply_text("✍ Send your new trading rule:", reply_markup=back_menu(ctx))
+
+async def act_rule_edit(update, ctx, arg):
+    s = Session()
+    u = get_user(update.effective_user.id)
+    rule = s.query(Rule).get(arg)
+    if rule and rule.user_id == u.id:
+        ctx.user_data['mode'] = 'rule_edit'
+        ctx.user_data['rule_id'] = arg
+        await update.message.reply_text(f"Current:\n{rule.text}\n\nSend new version:", reply_markup=back_menu(ctx))
+    s.close()
+
+async def act_rule_del(update, ctx, arg):
+    s = Session()
+    u = get_user(update.effective_user.id)
+    s.query(Rule).filter_by(id=arg, user_id=u.id).delete()
+    s.commit()
+    s.close()
+    await show_rules(update, ctx)
+
+# ---------------------------------------------------------------------------
+# Journal / view / analyse / gallery / admin
+# ---------------------------------------------------------------------------
+
+async def act_journal_month(update, ctx, arg):
+    year, month = arg
+    s = Session()
+    u = get_user(update.effective_user.id)
     trades = s.query(Trade).filter_by(user_id=u.id).filter(extract('year', Trade.opened_at) == year).filter(extract('month', Trade.opened_at) == month).order_by(Trade.opened_at.desc()).all()
-    kb = []
-    for t in trades:
+    rows = []
+    for i, t in enumerate(trades):
         date_str = t.opened_at.strftime('%d %b')
         if not t.closed_at:
             status = "🟢"
         else:
             tas = s.query(TradeAccount).filter_by(trade_id=t.id).all()
             total_pnl = sum(ta.pnl_usd or 0 for ta in tas)
-            if total_pnl > 0:
-                status = "✅"
-            elif total_pnl < 0:
-                status = "❌"
-            else:
-                status = "➖"
-        kb.append([InlineKeyboardButton(f"{date_str} {t.symbol} {t.direction} {status}", callback_data=f"view_{t.id}")])
-    kb.append([InlineKeyboardButton("⬅ Back to Months", callback_data="menu_journal")])
+            status = "✅" if total_pnl > 0 else "❌" if total_pnl < 0 else "➖"
+        rows.append([(f"{i+1}. {date_str} {t.symbol} {t.direction} {status}", "view_trade", t.id)])
+    rows.append([("⬅ Back to Months", "journal_back", None)])
     s.close()
     month_name = calendar.month_name[month]
-    await q.edit_message_text(f"📖 {month_name} {year} - {len(trades)} trades", reply_markup=InlineKeyboardMarkup(kb))
+    await update.message.reply_text(f"📖 {month_name} {year} - {len(trades)} trades", reply_markup=screen(ctx, rows))
 
-async def view_trade_cb(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    q = update.callback_query
-    await q.answer()
-    tid = q.data[5:]
+async def act_journal_back(update, ctx, arg):
+    await txt_journal(update, ctx)
+
+async def act_view_trade(update, ctx, arg):
+    tid = arg
     s = Session()
     tr = s.query(Trade).get(tid)
     if not tr:
         s.close()
-        await q.edit_message_text("Trade not found", reply_markup=back_button())
+        await update.message.reply_text("Trade not found", reply_markup=back_menu(ctx))
         return
     msg = f"📊 {tr.symbol} {tr.direction}\n📅 Opened: {tr.opened_at.strftime('%d %b %Y %H:%M')}\n"
     if tr.closed_at:
@@ -609,117 +764,219 @@ async def view_trade_cb(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
                 msg += f"🟢 {acc.name}: Open\n"
     year = tr.opened_at.year
     month = tr.opened_at.month
-    kb = [[InlineKeyboardButton("⬅ Back to Month", callback_data=f"journal_{year}_{month}")]]
-    await q.edit_message_text(msg, reply_markup=InlineKeyboardMarkup(kb))
-    photo_ids = []
+    rows = [[("⬅ Back to Month", "journal_month", (year, month))]]
+    await update.message.reply_text(msg, reply_markup=screen(ctx, rows))
     if tr.before_photo:
-        m1 = await q.message.reply_photo(tr.before_photo, caption="📸 BEFORE")
-        photo_ids.append(m1.message_id)
+        await update.message.reply_photo(tr.before_photo, caption="📸 BEFORE")
     if tr.after_photo:
-        m2 = await q.message.reply_photo(tr.after_photo, caption="📸 AFTER")
-        photo_ids.append(m2.message_id)
-    ctx.user_data['last_photos'] = photo_ids
+        await update.message.reply_photo(tr.after_photo, caption="📸 AFTER")
     s.close()
 
-async def admin_cb(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    q = update.callback_query
-    await q.answer()
-    if q.data == "admin_users":
-        s = Session()
-        users = s.query(User).all()
-        msg = f"👥 Users ({len(users)})\n\n"
-        for u in users:
-            msg += f"• {u.telegram_id} {'(admin)' if u.is_admin=='1' else ''}\n"
-        s.close()
-        await q.edit_message_text(msg, reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("⬅ Back", callback_data="menu_admin")]]))
-
-async def pair_cb(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    q = update.callback_query
-    await q.answer()
-    s = Session()
-    if q.data == "pair_add":
-        ctx.user_data['mode'] = 'pair_add'
-        await q.edit_message_text("Send pair symbol (e.g. EURUSD)", reply_markup=back_button())
-    elif q.data.startswith("pairdel_"):
-        pid = q.data[8:]
-        s.query(Pair).filter_by(id=pid).delete()
-        s.commit()
-        await q.edit_message_text("✅ Pair deleted", reply_markup=back_button())
-    s.close()
-
-async def delacc_cb(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    q = update.callback_query
-    await q.answer()
-    aid = q.data[7:]
-    s = Session()
-    s.query(Account).filter_by(id=aid).delete()
-    s.commit()
-    s.close()
-    await q.edit_message_text("✅ Account deleted", reply_markup=back_button())
-
-async def txt_rules(update, ctx):
+async def act_analyse(update, ctx, arg):
+    period = arg
     s = Session()
     u = get_user(update.effective_user.id)
-    rules = s.query(Rule).filter_by(user_id=u.id).order_by(Rule.order_num, Rule.created_at).all()
-    s.close()
-    if not rules:
-        msg = "📏 My Rules\n\nNo rules yet."
+    now = datetime.utcnow()
+    if period == 'today':
+        start = now.replace(hour=0, minute=0, second=0, microsecond=0); end = now; label = "TODAY"
+    elif period == 'week':
+        start = (now - timedelta(days=now.weekday())).replace(hour=0, minute=0, second=0, microsecond=0); end = now; label = "THIS WEEK"
+    elif period == 'month':
+        start = now.replace(day=1, hour=0, minute=0, second=0, microsecond=0); end = now; label = "THIS MONTH"
+    elif period == 'lastmonth':
+        first_this = now.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
+        end = first_this - timedelta(seconds=1)
+        start = end.replace(day=1, hour=0, minute=0, second=0, microsecond=0); label = "LAST MONTH"
+    elif period == 'year':
+        start = now.replace(month=1, day=1, hour=0, minute=0, second=0, microsecond=0); end = now; label = "THIS YEAR"
     else:
-        msg = "📏 My Rules\n\n" + "\n\n".join([f"{i}. {r.text}" for i, r in enumerate(rules, 1)])
-    kb = []
-    for r in rules:
-        kb.append([InlineKeyboardButton("✏", callback_data=f"rule_edit_{r.id}"), InlineKeyboardButton("🗑", callback_data=f"rule_del_{r.id}")])
-    kb.append([InlineKeyboardButton("➕ Add Rule", callback_data="rule_add")])
-    kb.append([InlineKeyboardButton("⬅ Back", callback_data="back_main")])
-    await update.message.reply_text(msg, reply_markup=InlineKeyboardMarkup(kb))
+        start = None; end = None; label = "ALL TIME"
+    query = s.query(Trade).filter_by(user_id=u.id).filter(Trade.closed_at != None)
+    if start:
+        query = query.filter(Trade.closed_at >= start)
+    if end and period != 'all':
+        query = query.filter(Trade.closed_at <= end)
+    trades = query.all()
+    trade_ids = [t.id for t in trades]
+    tas = s.query(TradeAccount).filter(TradeAccount.trade_id.in_(trade_ids)).filter(TradeAccount.pnl_usd != None).all() if trade_ids else []
+    total_trades = len(trades)
+    wins = len([t for t in tas if t.pnl_usd > 0])
+    losses = len([t for t in tas if t.pnl_usd < 0])
+    winrate = (wins / len(tas) * 100) if tas else 0
+    total_pnl = sum(t.pnl_usd for t in tas) if tas else 0
+    avg_win = sum(t.pnl_usd for t in tas if t.pnl_usd > 0) / wins if wins else 0
+    avg_loss = sum(t.pnl_usd for t in tas if t.pnl_usd < 0) / losses if losses else 0
+    tp = len([t for t in tas if t.result == 'TP'])
+    sl = len([t for t in tas if t.result == 'SL'])
+    be = len([t for t in tas if t.result == 'BE'])
+    pair_pnl = {}
+    for tr in trades:
+        for ta in [x for x in tas if x.trade_id == tr.id]:
+            pair_pnl[tr.symbol] = pair_pnl.get(tr.symbol, 0) + (ta.pnl_usd or 0)
+    best = max(pair_pnl.items(), key=lambda x: x[1]) if pair_pnl else ("-", 0)
+    worst = min(pair_pnl.items(), key=lambda x: x[1]) if pair_pnl else ("-", 0)
+    s.close()
+    date_str = f"{start.strftime('%d %b')} - {end.strftime('%d %b')}" if start and period != 'all' else ""
+    msg = f"📊 {label} {date_str}\n\nTrades: {total_trades}\nWin Rate: {winrate:.1f}% ({wins}W/{losses}L)\nTotal PnL: ${total_pnl:+.2f}\n"
+    if wins or losses:
+        msg += f"Avg Win: ${avg_win:.0f} | Avg Loss: ${avg_loss:.0f}\n"
+    msg += f"\nBest: {best[0]} (${best[1]:+.0f})\nWorst: {worst[0]} (${worst[1]:+.0f})\n\n✅ TP:{tp} ❌ SL:{sl} ➖ BE:{be}"
+    rows = [[("⬅ Back", "analyse_back", None)]]
+    await update.message.reply_text(msg, reply_markup=screen(ctx, rows))
 
-async def rules_cb(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    q = update.callback_query
-    await q.answer()
-    data = q.data
+async def act_analyse_back(update, ctx, arg):
+    await txt_analyse(update, ctx)
+
+async def act_gallery(update, ctx, arg):
+    data = arg
     s = Session()
-    u = get_user(q.from_user.id)
-    if data == "rule_add":
-        ctx.user_data['mode'] = 'rule_add'
-        await q.edit_message_text("✍ Send your new trading rule:", reply_markup=back_button())
-        s.close()
-        return
-    elif data.startswith("rule_edit_"):
-        rid = data[10:]
-        rule = s.query(Rule).get(rid)
-        if rule and rule.user_id == u.id:
-            ctx.user_data['mode'] = 'rule_edit'
-            ctx.user_data['rule_id'] = rid
-            await q.edit_message_text(f"Current:\n{rule.text}\n\nSend new version:", reply_markup=back_button())
-        s.close()
-        return
-    elif data.startswith("rule_del_"):
-        rid = data[9:]
-        s.query(Rule).filter_by(id=rid, user_id=u.id).delete()
-        s.commit()
-    rules = s.query(Rule).filter_by(user_id=u.id).order_by(Rule.order_num, Rule.created_at).all()
-    s.close()
-    if not rules:
-        msg = "📏 My Rules\n\nNo rules yet."
+    u = get_user(update.effective_user.id)
+    now = datetime.utcnow()
+    if data == "today":
+        start = now.replace(hour=0, minute=0, second=0, microsecond=0)
+        trades = s.query(Trade).filter_by(user_id=u.id).filter(Trade.before_photo != None, Trade.opened_at >= start).order_by(Trade.opened_at.asc()).all()
+        label = "Today"
+    elif data == "week":
+        start = (now - timedelta(days=now.weekday())).replace(hour=0, minute=0, second=0, microsecond=0)
+        trades = s.query(Trade).filter_by(user_id=u.id).filter(Trade.before_photo != None, Trade.opened_at >= start).order_by(Trade.opened_at.asc()).all()
+        label = "This Week"
+    elif data == "month":
+        start = now.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
+        trades = s.query(Trade).filter_by(user_id=u.id).filter(Trade.before_photo != None, Trade.opened_at >= start).order_by(Trade.opened_at.asc()).all()
+        label = "This Month"
+    elif data == "year":
+        start = now.replace(month=1, day=1, hour=0, minute=0, second=0, microsecond=0)
+        trades = s.query(Trade).filter_by(user_id=u.id).filter(Trade.before_photo != None, Trade.opened_at >= start).order_by(Trade.opened_at.asc()).all()
+        label = "This Year"
     else:
-        msg = "📏 My Rules\n\n" + "\n\n".join([f"{i}. {r.text}" for i, r in enumerate(rules, 1)])
-    kb = []
-    for r in rules:
-        kb.append([InlineKeyboardButton("✏", callback_data=f"rule_edit_{r.id}"), InlineKeyboardButton("🗑", callback_data=f"rule_del_{r.id}")])
-    kb.append([InlineKeyboardButton("➕ Add Rule", callback_data="rule_add")])
-    kb.append([InlineKeyboardButton("⬅ Back", callback_data="back_main")])
-    await q.edit_message_text(msg, reply_markup=InlineKeyboardMarkup(kb))
+        trades = s.query(Trade).filter_by(user_id=u.id).filter(Trade.before_photo != None).order_by(Trade.opened_at.asc()).all()
+        label = "All Time"
+    if not trades:
+        s.close()
+        await update.message.reply_text(f"🖼 No photos for {label}", reply_markup=screen(ctx, [[("⬅ Back", "gallery_back", None)]]))
+        return
+    await update.message.reply_text(f"🖼 Gallery - {label} ({len(trades)} trades)", reply_markup=screen(ctx, [[("⬅ Back", "gallery_back", None)]]))
+    for tr in trades:
+        ta = s.query(TradeAccount).filter_by(trade_id=tr.id).first()
+        result = f" • {ta.result}" if ta and ta.result else ""
+        base = f"{tr.symbol} {tr.direction} • {tr.opened_at.strftime('%d %b %Y')}{result}"
+        before_cap = "BEFORE: " + base
+        if tr.before_comment:
+            before_cap += f"\n💬 {tr.before_comment}"
+        after_cap = "AFTER: " + base
+        if tr.close_comment:
+            after_cap += f"\n💬 {tr.close_comment}"
+        try:
+            if tr.before_photo:
+                await update.message.reply_photo(tr.before_photo, caption=before_cap)
+            if tr.after_photo:
+                await update.message.reply_photo(tr.after_photo, caption=after_cap)
+        except:
+            continue
+    s.close()
+
+async def act_gallery_back(update, ctx, arg):
+    await txt_gallery(update, ctx)
+
+async def act_admin_users(update, ctx, arg):
+    s = Session()
+    users = s.query(User).all()
+    msg = f"👥 Users ({len(users)})\n\n"
+    for u in users:
+        msg += f"• {u.telegram_id} {'(admin)' if u.is_admin == '1' else ''}\n"
+    s.close()
+    await update.message.reply_text(msg, reply_markup=back_menu(ctx))
+
+async def act_wallet(update, ctx, arg):
+    await show_wallet(update, ctx)
+
+async def act_main(update, ctx, arg):
+    await show_main(update, ctx)
+
+async def act_before_skip(update, ctx, arg):
+    ctx.user_data.clear()
+    await update.message.reply_text("✅ Trade logged", reply_markup=main_menu(update.effective_user.id))
+
+# ---------------------------------------------------------------------------
+# Dispatch table for reply-keyboard button taps
+# ---------------------------------------------------------------------------
+
+DISPATCH = {
+    "main": act_main,
+    "wallet": act_wallet,
+    "trade_acc": act_trade_acc,
+    "trade_pair": act_trade_pair,
+    "dir": act_dir,
+    "close_trade": act_close_trade,
+    "close_res": act_close_res,
+    "closeacc": act_closeacc,
+    "closeacc_back": act_closeacc_back,
+    "closeacc_done": act_closeacc_done,
+    "comment_skip": act_comment_skip,
+    "before_skip": act_before_skip,
+    "profit_starting": act_profit_starting,
+    "profit_challenge": act_profit_challenge,
+    "profit_deposit": act_profit_deposit,
+    "profit_withdraw": act_profit_withdraw,
+    "profit_payout": act_profit_payout,
+    "profit_stats": act_profit_stats,
+    "profit_history": act_profit_history,
+    "profit_reset": act_profit_reset,
+    "profit_edit": act_profit_edit,
+    "clear_chat": act_clear_chat,
+    "reset_yes": act_reset_yes,
+    "wd_pick": act_wd_pick,
+    "payout_pick": act_payout_pick,
+    "deposit_pick": act_deposit_pick,
+    "bal_edit": act_bal_edit,
+    "bal_reset": act_bal_reset,
+    "bal_reset_yes": act_bal_reset_yes,
+    "balance_menu": act_balance_menu,
+    "add_live": act_add_live,
+    "add_challenge": act_add_challenge,
+    "cut": act_cut,
+    "archive": act_archive,
+    "delacc": act_delacc,
+    "pair_add": act_pair_add,
+    "pairdel": act_pairdel,
+    "rule_add": act_rule_add,
+    "rule_edit": act_rule_edit,
+    "rule_del": act_rule_del,
+    "journal_month": act_journal_month,
+    "journal_back": act_journal_back,
+    "view_trade": act_view_trade,
+    "analyse": act_analyse,
+    "analyse_back": act_analyse_back,
+    "gallery": act_gallery,
+    "gallery_back": act_gallery_back,
+    "admin_users": act_admin_users,
+}
+
+# ---------------------------------------------------------------------------
+# Central text handler: first resolve reply-keyboard button taps via the
+# per-screen nav map, then fall through to free-text input modes.
+# ---------------------------------------------------------------------------
 
 async def text_handler(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    mode = ctx.user_data.get('mode')
     txt = update.message.text.strip()
+
+    # 1) Reply-keyboard button tap for the current screen
+    nav = ctx.user_data.get('nav', {})
+    if txt in nav:
+        action, arg = nav[txt]
+        fn = DISPATCH.get(action)
+        if fn:
+            return await fn(update, ctx, arg)
+
+    # 2) Free-text input modes
+    mode = ctx.user_data.get('mode')
     s = Session()
     u = get_user(update.effective_user.id)
     if mode == 'starting_balance':
         try:
-            amt = float(txt.replace(',', '').replace('$','').replace('+',''))
+            amt = float(txt.replace(',', '').replace('$', '').replace('+', ''))
         except:
-            await update.message.reply_text("❌ Send a number like -10000 or 5000", reply_markup=back_tools())
+            await update.message.reply_text("❌ Send a number like -10000 or 5000", reply_markup=back_wallet(ctx))
             s.close()
             return
         s.query(CashTx).filter_by(user_id=u.id, type='INITIAL').delete()
@@ -735,12 +992,12 @@ async def text_handler(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         if step == 1:
             ctx.user_data['na_name'] = txt
             ctx.user_data['step'] = 2
-            await update.message.reply_text("Account size?" if atype == 'CHALLENGE' else "Starting balance?", reply_markup=back_button())
+            await update.message.reply_text("Account size?" if atype == 'CHALLENGE' else "Starting balance?", reply_markup=back_menu(ctx))
         elif step == 2:
             ctx.user_data['na_bal'] = float(txt)
             if atype == 'CHALLENGE':
                 ctx.user_data['step'] = 3
-                await update.message.reply_text("Fee paid?", reply_markup=back_button())
+                await update.message.reply_text("Fee paid?", reply_markup=back_menu(ctx))
             else:
                 bal = ctx.user_data['na_bal']
                 acc = Account(user_id=u.id, name=ctx.user_data['na_name'], type='LIVE', start_balance=bal, current_balance=bal)
@@ -751,7 +1008,8 @@ async def text_handler(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
                 await update.message.reply_text(f"✅ {acc.name} LIVE created", reply_markup=main_menu(update.effective_user.id))
         elif step == 3:
             ctx.user_data['na_fee'] = float(txt)
-            await update.message.reply_text("Prop cut %?", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("10%", callback_data="cut_10"), InlineKeyboardButton("20%", callback_data="cut_20")]]))
+            rows = [[("10%", "cut", "10"), ("20%", "cut", "20")]]
+            await update.message.reply_text("Prop cut %?", reply_markup=screen(ctx, rows))
     elif mode == 'withdraw':
         amt = float(txt)
         acc = s.query(Account).get(ctx.user_data['wd_acc'])
@@ -787,7 +1045,7 @@ async def text_handler(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     elif mode == 'bal_edit':
         new_amt = float(txt)
         current = s.query(func.sum(CashTx.amount)).filter_by(user_id=u.id).scalar() or 0
-        s.add(CashTx(user_id=u.id, type='ADJUST', amount=new_amt-current, note='Manual'))
+        s.add(CashTx(user_id=u.id, type='ADJUST', amount=new_amt - current, note='Manual'))
         s.commit()
         ctx.user_data.clear()
         await update.message.reply_text(f"✅ Bank ${new_amt:.2f}", reply_markup=main_menu(update.effective_user.id))
@@ -811,7 +1069,7 @@ async def text_handler(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         return
     elif mode == 'close_pnl':
         try:
-            pnl = float(txt.replace('+',''))
+            pnl = float(txt.replace('+', ''))
         except:
             await update.message.reply_text("Send number like -50 or +120")
             s.close()
@@ -819,7 +1077,9 @@ async def text_handler(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         acc_id = ctx.user_data['close']['current_acc']
         ctx.user_data['close']['tas'][acc_id] = pnl
         ctx.user_data['mode'] = 'close'
+        s.close()
         await show_close_accounts_menu(update, ctx)
+        return
     elif mode == 'await_before_comment':
         tid = ctx.user_data.get('before_trade_id')
         tr = s.query(Trade).get(tid)
@@ -831,10 +1091,14 @@ async def text_handler(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         s.close()
         return
     elif mode == 'await_comment':
-        await finalize_trade(update, ctx, txt)
         s.close()
+        await finalize_trade(update, ctx, txt)
         return
     s.close()
+
+# ---------------------------------------------------------------------------
+# Photo handler
+# ---------------------------------------------------------------------------
 
 async def photo_handler(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     mode = ctx.user_data.get('mode')
@@ -850,7 +1114,8 @@ async def photo_handler(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         s.commit()
         ctx.user_data['mode'] = 'await_before_comment'
         ctx.user_data['before_trade_id'] = tr.id
-        await update.message.reply_text("✍ Add note for BEFORE photo? (optional)", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("⏭ Skip", callback_data="before_skip")]]))
+        rows = [[("⏭ Skip", "before_skip", None)]]
+        await update.message.reply_text("✍ Add note for BEFORE photo? (optional)", reply_markup=screen(ctx, rows))
         s.close()
         return
     elif mode == 'close' and ctx.user_data.get('close', {}).get('step') == 'photo':
@@ -859,263 +1124,20 @@ async def photo_handler(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         tr.after_photo = update.message.photo[-1].file_id
         s.commit()
         ctx.user_data['close']['step'] = 'result'
-        await update.message.reply_text("Close as?", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("SL ❌", callback_data="res_SL"), InlineKeyboardButton("BE ➖", callback_data="res_BE"), InlineKeyboardButton("TP ✅", callback_data="res_TP")]]))
+        rows = [[("SL ❌", "close_res", "SL"), ("BE ➖", "close_res", "BE"), ("TP ✅", "close_res", "TP")]]
+        await update.message.reply_text("Close as?", reply_markup=screen(ctx, rows))
     s.close()
 
-async def txt_log(update, ctx):
-    s = Session()
-    u = get_user(update.effective_user.id)
-    accs = s.query(Account).filter_by(user_id=u.id, status='ACTIVE').all()
-    s.close()
-    if not accs:
-        await update.message.reply_text("⚠ No active accounts. Add one first.", reply_markup=main_menu(update.effective_user.id))
-        return
-    ctx.user_data['mode'] = 'trade'
-    ctx.user_data['trade'] = {}
-    kb = [[InlineKeyboardButton(a.name, callback_data=f"ta_{a.id}")] for a in accs]
-    kb.append([InlineKeyboardButton("All Accounts", callback_data="ta_all")])
-    kb.append([InlineKeyboardButton("⬅ Back", callback_data="back_main")])
-    await update.message.reply_text("Select account:", reply_markup=InlineKeyboardMarkup(kb))
-
-async def txt_close(update, ctx):
-    s = Session()
-    u = get_user(update.effective_user.id)
-    trs = s.query(Trade).filter_by(user_id=u.id, closed_at=None).all()
-    s.close()
-    if not trs:
-        await update.message.reply_text("No open trades", reply_markup=main_menu(update.effective_user.id))
-        return
-    kb = [[InlineKeyboardButton(f"{t.symbol} {t.direction}", callback_data=f"tc_{t.id}")] for t in trs]
-    kb.append([InlineKeyboardButton("⬅ Back", callback_data="back_main")])
-    await update.message.reply_text("Select trade to close:", reply_markup=InlineKeyboardMarkup(kb))
-
-async def txt_balance(update, ctx):
-    s = Session()
-    u = get_user(update.effective_user.id)
-    net = s.query(func.sum(CashTx.amount)).filter_by(user_id=u.id).scalar() or 0
-    s.close()
-    await update.message.reply_text(f"💰 Bank Balance: ${net:.2f}", reply_markup=back_button())
-
-async def txt_accounts(update, ctx):
-    s = Session()
-    u = get_user(update.effective_user.id)
-    accs = s.query(Account).filter_by(user_id=u.id, status='ACTIVE').all()
-    s.close()
-    msg = "⚙ My Accounts\n" + "\n".join([f"🟢 {a.name} - ${a.current_balance:.0f}" for a in accs])
-    await update.message.reply_text(msg or "No accounts", reply_markup=back_button())
-
-async def txt_analyse(update, ctx):
-    kb = [[InlineKeyboardButton("📅 Today", callback_data="analyse_today"), InlineKeyboardButton("📆 This Week", callback_data="analyse_week")], [InlineKeyboardButton("🗓 This Month", callback_data="analyse_month"), InlineKeyboardButton("📆 Last Month", callback_data="analyse_lastmonth")], [InlineKeyboardButton("📈 This Year", callback_data="analyse_year"), InlineKeyboardButton("🌍 All Time", callback_data="analyse_all")], [InlineKeyboardButton("⬅ Back", callback_data="back_main")]]
-    msg = "📊 Analyse - Choose period"
-    if hasattr(update, 'callback_query') and update.callback_query:
-        await update.callback_query.edit_message_text(msg, reply_markup=InlineKeyboardMarkup(kb))
-    else:
-        await update.message.reply_text(msg, reply_markup=InlineKeyboardMarkup(kb))
-
-async def analyse_period_cb(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    q = update.callback_query
-    await q.answer()
-    period = q.data.split('_')[1]
-    s = Session()
-    u = get_user(q.from_user.id)
-    now = datetime.utcnow()
-    if period == 'today':
-        start = now.replace(hour=0, minute=0, second=0, microsecond=0)
-        end = now
-        label = "TODAY"
-    elif period == 'week':
-        start = (now - timedelta(days=now.weekday())).replace(hour=0, minute=0, second=0, microsecond=0)
-        end = now
-        label = "THIS WEEK"
-    elif period == 'month':
-        start = now.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
-        end = now
-        label = "THIS MONTH"
-    elif period == 'lastmonth':
-        first_this = now.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
-        end = first_this - timedelta(seconds=1)
-        start = end.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
-        label = "LAST MONTH"
-    elif period == 'year':
-        start = now.replace(month=1, day=1, hour=0, minute=0, second=0, microsecond=0)
-        end = now
-        label = "THIS YEAR"
-    else:
-        start = None
-        end = None
-        label = "ALL TIME"
-    query = s.query(Trade).filter_by(user_id=u.id).filter(Trade.closed_at!= None)
-    if start:
-        query = query.filter(Trade.closed_at >= start)
-    if end and period!= 'all':
-        query = query.filter(Trade.closed_at <= end)
-    trades = query.all()
-    trade_ids = [t.id for t in trades]
-    tas = s.query(TradeAccount).filter(TradeAccount.trade_id.in_(trade_ids)).filter(TradeAccount.pnl_usd!= None).all() if trade_ids else []
-    total_trades = len(trades)
-    wins = len([t for t in tas if t.pnl_usd > 0])
-    losses = len([t for t in tas if t.pnl_usd < 0])
-    winrate = (wins / len(tas) * 100) if tas else 0
-    total_pnl = sum(t.pnl_usd for t in tas) if tas else 0
-    avg_win = sum(t.pnl_usd for t in tas if t.pnl_usd > 0) / wins if wins else 0
-    avg_loss = sum(t.pnl_usd for t in tas if t.pnl_usd < 0) / losses if losses else 0
-    tp = len([t for t in tas if t.result == 'TP'])
-    sl = len([t for t in tas if t.result == 'SL'])
-    be = len([t for t in tas if t.result == 'BE'])
-    pair_pnl = {}
-    for tr in trades:
-        for ta in [x for x in tas if x.trade_id == tr.id]:
-            pair_pnl[tr.symbol] = pair_pnl.get(tr.symbol, 0) + (ta.pnl_usd or 0)
-    best = max(pair_pnl.items(), key=lambda x: x[1]) if pair_pnl else ("-", 0)
-    worst = min(pair_pnl.items(), key=lambda x: x[1]) if pair_pnl else ("-", 0)
-    s.close()
-    date_str = f"{start.strftime('%d %b')} - {end.strftime('%d %b')}" if start and period!= 'all' else ""
-    msg = f"📊 {label} {date_str}\n\nTrades: {total_trades}\nWin Rate: {winrate:.1f}% ({wins}W/{losses}L)\nTotal PnL: ${total_pnl:+.2f}\n"
-    if wins or losses:
-        msg += f"Avg Win: ${avg_win:.0f} | Avg Loss: ${avg_loss:.0f}\n"
-    msg += f"\nBest: {best[0]} (${best[1]:+.0f})\nWorst: {worst[0]} (${worst[1]:+.0f})\n\n✅ TP:{tp} ❌ SL:{sl} ➖ BE:{be}"
-    await q.edit_message_text(msg, reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("⬅ Back", callback_data="menu_analyse")]]))
-
-async def txt_journal(update, ctx):
-    s = Session()
-    u = get_user(update.effective_user.id)
-    trades = s.query(Trade).filter_by(user_id=u.id).order_by(Trade.opened_at.desc()).all()
-    s.close()
-    months = {}
-    for t in trades:
-        key = (t.opened_at.year, t.opened_at.month)
-        months[key] = months.get(key, 0) + 1
-    if not months:
-        await update.message.reply_text("📖 No trades yet", reply_markup=back_button())
-        return
-    kb = []
-    for (year, month), count in sorted(months.items(), reverse=True):
-        month_name = calendar.month_name[month]
-        kb.append([InlineKeyboardButton(f"{month_name} {year} ({count} trades)", callback_data=f"journal_{year}_{month}")])
-    kb.append([InlineKeyboardButton("⬅ Back", callback_data="back_main")])
-    await update.message.reply_text("📖 Journal - Select Month", reply_markup=InlineKeyboardMarkup(kb))
-
-async def txt_pairs(update, ctx):
-    s = Session()
-    u = get_user(update.effective_user.id)
-    pairs = s.query(Pair).filter_by(user_id=u.id).all()
-    s.close()
-    kb = [[InlineKeyboardButton(f"❌ {p.symbol}", callback_data=f"pairdel_{p.id}")] for p in pairs]
-    kb.append([InlineKeyboardButton("➕ Add Pair", callback_data="pair_add")])
-    kb.append([InlineKeyboardButton("⬅ Back to Menu", callback_data="back_main")])
-    await update.message.reply_text("📈 My Pairs", reply_markup=InlineKeyboardMarkup(kb))
-
-async def txt_hist(update, ctx):
-    s = Session()
-    u = get_user(update.effective_user.id)
-    tas = s.query(TradeAccount).join(Trade).filter(Trade.user_id == u.id).filter(TradeAccount.closed_at!= None).order_by(TradeAccount.closed_at.desc()).limit(20).all()
-    msg = "📜 Trade History\n\n"
-    for ta in tas:
-        tr = s.query(Trade).get(ta.trade_id)
-        acc = s.query(Account).get(ta.account_id)
-        if tr and ta.pnl_usd is not None:
-            msg += f"{tr.opened_at.strftime('%d %b %Y')} {tr.symbol} {ta.result or ''} ${ta.pnl_usd:+.0f} ({acc.name})\n"
-    s.close()
-    await update.message.reply_text(msg or "No history yet", reply_markup=back_button())
-
-async def txt_add(update, ctx):
-    await update.message.reply_text("Choose type:", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("💼 Live", callback_data="add_live"), InlineKeyboardButton("🎯 Challenge", callback_data="add_challenge")]]))
-
-async def txt_profit(update, ctx):
-    await update.message.reply_text("💰 Wallet & Tools", reply_markup=profit_menu())
-
-async def txt_admin(update, ctx):
-    await update.message.reply_text("👑 ADMIN", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("👥 Users", callback_data="admin_users")]]))
-
-async def txt_gallery(update, ctx):
-    kb = [[InlineKeyboardButton("📅 Today", callback_data="gallery_today"), InlineKeyboardButton("📆 This Week", callback_data="gallery_week")], [InlineKeyboardButton("🗓 This Month", callback_data="gallery_month"), InlineKeyboardButton("📈 This Year", callback_data="gallery_year")], [InlineKeyboardButton("🌍 All Trades", callback_data="gallery_all")], [InlineKeyboardButton("⬅ Back", callback_data="back_main")]]
-    await update.message.reply_text("🖼 Gallery - Choose period", reply_markup=InlineKeyboardMarkup(kb))
-
-async def gallery_cb(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    q = update.callback_query
-    await q.answer()
-    data = q.data
-    s = Session()
-    u = get_user(q.from_user.id)
-    now = datetime.utcnow()
-    if data == "gallery_back":
-        s.close()
-        kb = [[InlineKeyboardButton("📅 Today", callback_data="gallery_today"), InlineKeyboardButton("📆 This Week", callback_data="gallery_week")], [InlineKeyboardButton("🗓 This Month", callback_data="gallery_month"), InlineKeyboardButton("📈 This Year", callback_data="gallery_year")], [InlineKeyboardButton("🌍 All Trades", callback_data="gallery_all")], [InlineKeyboardButton("⬅ Back", callback_data="back_main")]]
-        await q.edit_message_text("🖼 Gallery - Choose period", reply_markup=InlineKeyboardMarkup(kb))
-        return
-    if data == "gallery_today":
-        start = now.replace(hour=0, minute=0, second=0, microsecond=0)
-        trades = s.query(Trade).filter_by(user_id=u.id).filter(Trade.before_photo!=None, Trade.opened_at >= start).order_by(Trade.opened_at.asc()).all()
-        label = "Today"
-    elif data == "gallery_week":
-        start = (now - timedelta(days=now.weekday())).replace(hour=0, minute=0, second=0, microsecond=0)
-        trades = s.query(Trade).filter_by(user_id=u.id).filter(Trade.before_photo!=None, Trade.opened_at >= start).order_by(Trade.opened_at.asc()).all()
-        label = "This Week"
-    elif data == "gallery_month":
-        start = now.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
-        trades = s.query(Trade).filter_by(user_id=u.id).filter(Trade.before_photo!=None, Trade.opened_at >= start).order_by(Trade.opened_at.asc()).all()
-        label = "This Month"
-    elif data == "gallery_year":
-        start = now.replace(month=1, day=1, hour=0, minute=0, second=0, microsecond=0)
-        trades = s.query(Trade).filter_by(user_id=u.id).filter(Trade.before_photo!=None, Trade.opened_at >= start).order_by(Trade.opened_at.asc()).all()
-        label = "This Year"
-    else:
-        trades = s.query(Trade).filter_by(user_id=u.id).filter(Trade.before_photo!=None).order_by(Trade.opened_at.asc()).all()
-        label = "All Time"
-    if not trades:
-        s.close()
-        await q.edit_message_text(f"🖼 No photos for {label}", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("⬅ Back", callback_data="gallery_back")]]))
-        return
-    await q.edit_message_text(f"🖼 Gallery - {label} ({len(trades)} trades)", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("⬅ Back", callback_data="gallery_back")]]))
-    for tr in trades:
-        ta = s.query(TradeAccount).filter_by(trade_id=tr.id).first()
-        result = f" • {ta.result}" if ta and ta.result else ""
-        base = f"{tr.symbol} {tr.direction} • {tr.opened_at.strftime('%d %b %Y')}{result}"
-        before_cap = "BEFORE: " + base
-        if tr.before_comment:
-            before_cap += f"\n💬 {tr.before_comment}"
-        after_cap = "AFTER: " + base
-        if tr.close_comment:
-            after_cap += f"\n💬 {tr.close_comment}"
-        try:
-            if tr.before_photo:
-                await q.message.reply_photo(tr.before_photo, caption=before_cap)
-            if tr.after_photo:
-                await q.message.reply_photo(tr.after_photo, caption=after_cap)
-        except:
-            continue
-    s.close()
+# ---------------------------------------------------------------------------
+# Bootstrap
+# ---------------------------------------------------------------------------
 
 def main():
     app = Application.builder().token(os.getenv("TELEGRAM_BOT_TOKEN")).build()
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("clear", clear_cmd))
     app.add_handler(CommandHandler("pairs", cmd_pairs))
-    app.add_handler(CallbackQueryHandler(back_main, pattern="^back_main$"))
-    app.add_handler(CallbackQueryHandler(before_skip_cb, pattern="^before_skip$"))
-    app.add_handler(CallbackQueryHandler(menu_cb, pattern="^(menu_|bal_|clear_|add_)"))
-    app.add_handler(CallbackQueryHandler(profit_cb, pattern="^profit_"))
-    app.add_handler(CallbackQueryHandler(archive_acc, pattern="^arch_"))
-    app.add_handler(CallbackQueryHandler(wd_select, pattern="^wd_"))
-    app.add_handler(CallbackQueryHandler(payout_select, pattern="^payout_"))
-    app.add_handler(CallbackQueryHandler(deposit_select, pattern="^deposit_"))
-    app.add_handler(CallbackQueryHandler(reset_yes, pattern="^reset_yes$"))
-    app.add_handler(CallbackQueryHandler(trade_acc_cb, pattern="^ta_"))
-    app.add_handler(CallbackQueryHandler(trade_pair_cb, pattern="^tp_"))
-    app.add_handler(CallbackQueryHandler(dir_cb, pattern="^dir_"))
-    app.add_handler(CallbackQueryHandler(cut_cb, pattern="^cut_"))
-    app.add_handler(CallbackQueryHandler(close_cb, pattern="^tc_"))
-    app.add_handler(CallbackQueryHandler(close_res_cb, pattern="^res_"))
-    app.add_handler(CallbackQueryHandler(close_acc_select, pattern="^closeacc_"))
-    app.add_handler(CallbackQueryHandler(close_acc_back, pattern="^closeacc_back$"))
-    app.add_handler(CallbackQueryHandler(journal_month_cb, pattern="^journal_"))
-    app.add_handler(CallbackQueryHandler(view_trade_cb, pattern="^view_"))
-    app.add_handler(CallbackQueryHandler(admin_cb, pattern="^admin_"))
-    app.add_handler(CallbackQueryHandler(pair_cb, pattern="^pair"))
-    app.add_handler(CallbackQueryHandler(delacc_cb, pattern="^delacc_"))
-    app.add_handler(CallbackQueryHandler(comment_skip_cb, pattern="^comment_skip$"))
-    app.add_handler(CallbackQueryHandler(rules_cb, pattern="^rule_"))
-    app.add_handler(CallbackQueryHandler(analyse_period_cb, pattern="^analyse_"))
+    # Persistent main-menu reply buttons
     app.add_handler(MessageHandler(filters.Regex("^📝 Log Trade$"), txt_log))
     app.add_handler(MessageHandler(filters.Regex("^✅ Close Trade$"), txt_close))
     app.add_handler(MessageHandler(filters.Regex("^💰 Balance$"), txt_balance))
@@ -1129,9 +1151,9 @@ def main():
     app.add_handler(MessageHandler(filters.Regex("^💰 Wallet & Tools$"), txt_profit))
     app.add_handler(MessageHandler(filters.Regex("^👑 ADMIN PANEL$"), txt_admin))
     app.add_handler(MessageHandler(filters.Regex("^📏 My Rules$"), txt_rules))
+    # Photos and everything else (sub-menu taps + typed input)
     app.add_handler(MessageHandler(filters.PHOTO, photo_handler))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, text_handler))
-    app.add_handler(CallbackQueryHandler(gallery_cb, pattern="^gallery_"))
     print("Bot started...")
     app.run_polling()
 
