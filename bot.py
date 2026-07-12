@@ -71,7 +71,7 @@ class CashTx(Base):
     __tablename__ = 'cash_txs'
     id = Column(String, primary_key=True, default=uid)
     user_id = Column(String, ForeignKey('users.id'))
-    type = Column(String) # FEE, DEPOSIT, PAYOUT, WITHDRAW, ADJUST, INITIAL
+    type = Column(String)
     amount = Column(Float)
     note = Column(Text)
     date = Column(DateTime, default=datetime.utcnow)
@@ -135,7 +135,6 @@ def back_tools():
     return InlineKeyboardMarkup([[InlineKeyboardButton("⬅ Back to Wallet", callback_data="menu_profit")]])
 
 def profit_menu():
-    # UPDATED: Added Starting Balance button for Option 1
     return InlineKeyboardMarkup([
         [InlineKeyboardButton("📉 Starting Balance", callback_data="profit_starting")],
         [InlineKeyboardButton("💳 Challenge Buy", callback_data="profit_challenge"), InlineKeyboardButton("💰 Live Deposit", callback_data="profit_deposit")],
@@ -298,23 +297,12 @@ async def profit_cb(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     d = q.data
     s = Session()
     u = get_user(q.from_user.id)
-
     if d == "profit_starting":
         init = s.query(func.sum(CashTx.amount)).filter_by(user_id=u.id, type='INITIAL').scalar() or 0
         s.close()
         ctx.user_data['mode'] = 'starting_balance'
-        await q.edit_message_text(
-            f"📉 Current Starting Balance: ${init:+.2f}\n\n"
-            "Send your REAL P/L before using this bot.\n\n"
-            "Examples:\n"
-            "-10000 -> you lost 10k last year (bank will start at -10k)\n"
-            "0 -> fresh start\n"
-            "3500 -> you were up 3.5k before\n\n"
-            "Just send the number:",
-            reply_markup=back_tools()
-        )
+        await q.edit_message_text(f"📉 Current Starting Balance: ${init:+.2f}\n\nSend your REAL P/L before using this bot.\n\nExamples:\n-10000 -> you lost 10k\n0 -> fresh start\n3500 -> you were up 3.5k\n\nJust send the number:", reply_markup=back_tools())
         return
-
     if d == "profit_withdraw":
         accs = s.query(Account).filter_by(user_id=u.id, status='ACTIVE').all()
         kb = [[InlineKeyboardButton(a.name, callback_data=f"wd_{a.id}")] for a in accs]
@@ -341,17 +329,7 @@ async def profit_cb(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         withdraws = s.query(func.sum(CashTx.amount)).filter_by(user_id=u.id, type='WITHDRAW').scalar() or 0
         initial = s.query(func.sum(CashTx.amount)).filter_by(user_id=u.id, type='INITIAL').scalar() or 0
         net = s.query(func.sum(CashTx.amount)).filter_by(user_id=u.id).scalar() or 0
-        await q.edit_message_text(
-            f"📊 Stats\n"
-            f"Starting (Old): ${initial:+.2f}\n"
-            f"Fees: ${abs(fees):.2f}\n"
-            f"Live Capital: ${abs(deposits):.2f}\n"
-            f"Payouts: ${payouts:.2f}\n"
-            f"Withdraws: ${abs(withdraws):.2f}\n"
-            f"-----------------\n"
-            f"Net Real: ${net:.2f}",
-            reply_markup=back_tools()
-        )
+        await q.edit_message_text(f"📊 Stats\nStarting (Old): ${initial:+.2f}\nFees: ${abs(fees):.2f}\nLive Capital: ${abs(deposits):.2f}\nPayouts: ${payouts:.2f}\nWithdraws: ${abs(withdraws):.2f}\n-----------------\nNet Real: ${net:.2f}", reply_markup=back_tools())
     elif d == "profit_history":
         txs = s.query(CashTx).filter_by(user_id=u.id).order_by(CashTx.date.desc()).limit(20).all()
         msg = "📜 Bank History\n\n"
@@ -685,7 +663,7 @@ async def txt_rules(update, ctx):
     rules = s.query(Rule).filter_by(user_id=u.id).order_by(Rule.order_num, Rule.created_at).all()
     s.close()
     if not rules:
-        msg = "📏 My Rules\n\nNo rules yet. Add your trading rules to stay disciplined."
+        msg = "📏 My Rules\n\nNo rules yet."
     else:
         msg = "📏 My Rules\n\n" + "\n\n".join([f"{i}. {r.text}" for i, r in enumerate(rules, 1)])
     kb = []
@@ -737,7 +715,6 @@ async def text_handler(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     txt = update.message.text.strip()
     s = Session()
     u = get_user(update.effective_user.id)
-
     if mode == 'starting_balance':
         try:
             amt = float(txt.replace(',', '').replace('$','').replace('+',''))
@@ -752,7 +729,6 @@ async def text_handler(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         ctx.user_data.clear()
         await update.message.reply_text(f"✅ Starting balance set to ${amt:+.2f}\nYour Bank Balance now includes this. Check 💰 Balance", reply_markup=main_menu(update.effective_user.id))
         return
-
     if mode == 'new_acc':
         step = ctx.user_data.get('step', 1)
         atype = ctx.user_data.get('atype')
