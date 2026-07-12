@@ -178,6 +178,33 @@ async def clear_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 async def cmd_pairs(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     await txt_pairs(update, ctx)
 
+def fmt_money(v: float) -> str:
+    """Format money with the sign in front of the $ sign (-$103.00 not $-103.00)."""
+    return f"-${abs(v):.2f}" if v < 0 else f"${v:.2f}"
+
+async def fixfees_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """One-shot repair: flip any legacy positive FEE / DEPOSIT rows to negative.
+    FEEs and DEPOSITs are money going OUT of the bank, so they must be stored
+    as negative CashTx amounts. Older versions of the bot stored them positive."""
+    s = Session()
+    u = get_user(update.effective_user.id)
+    fixed = 0
+    rows = s.query(CashTx).filter(
+        CashTx.user_id == u.id,
+        CashTx.type.in_(('FEE', 'DEPOSIT')),
+        CashTx.amount > 0,
+    ).all()
+    for r in rows:
+        r.amount = -r.amount
+        fixed += 1
+    s.commit()
+    net = s.query(func.sum(CashTx.amount)).filter_by(user_id=u.id).scalar() or 0
+    s.close()
+    await update.message.reply_text(
+        f"🔧 Repaired {fixed} legacy FEE/DEPOSIT row(s).\n"
+        f"💰 Bank Balance: {fmt_money(net)}",
+    )
+
 # ---------------------------------------------------------------------------
 # Main menu screens (triggered by the persistent reply keyboard)
 # ---------------------------------------------------------------------------
@@ -218,7 +245,7 @@ async def txt_balance(update, ctx):
     ctx.user_data.pop('mode', None)
     rows = [[("✏ Edit", "bal_edit", None), ("🔄 Reset", "bal_reset", None)],
             [("⬅ Back to Menu", "main", None)]]
-    await update.message.reply_text(f"💰 Bank Balance: ${net:.2f}", reply_markup=screen(ctx, rows))
+    await update.message.reply_text(f"💰 Bank Balance: {fmt_money(net)}", reply_markup=screen(ctx, rows))
 
 async def txt_accounts(update, ctx):
     s = Session()
@@ -232,7 +259,12 @@ async def txt_accounts(update, ctx):
     msg += "\n📦 Archived:\n"
     for a in arch:
         msg += f"• {a.name}\n"
-    rows = [[(f"📦 Archive {a.name}", "archive", a.id)] for a in accs]
+    rows = []
+    for a in accs:
+        row = [(f"📦 Archive {a.name}", "archive", a.id)]
+        if a.type == 'CHALLENGE':
+            row.append((f"✏ Cut {a.name}", "cut_edit", a.id))
+        rows.append(row)
     rows.append([("⬅ Back to Menu", "main", None)])
     s.close()
     ctx.user_data.pop('mode', None)
@@ -683,9 +715,66 @@ async def act_cut(update, ctx, arg):
     s.add(acc)
     s.add(CashTx(user_id=u.id, type='FEE', amount=-fee, note=f"Buy {name}"))
     s.commit()
+    net = s.query(func.sum(CashTx.amount)).filter_by(user_id=u.id).scalar() or 0
     s.close()
     ctx.user_data.clear()
-    await update.message.reply_text(f"✅ {name} CHALLENGE created\nFee: ${fee} | Prop cut: {cut}%", reply_markup=main_menu(update.effective_user.id))
+    await update.message.reply_text(
+        f"✅ {name} CHALLENGE created\n"
+        f"Fee paid: -${fee:.2f}   |   Prop cut: {cut:.0f}%\n"
+        f"💰 Bank Balance: {fmt_money(net)}",
+        reply_markup=main_menu(update.effective_user.id),
+    )
+
+
+async def act_cut_edit(update, ctx, arg):
+    """Change payout_cut % on an existing CHALLENGE account."""
+    s = Session()
+    a = s.query(Account).get(arg)
+    if not a:
+        s.close()
+        await update.message.reply_text("Account not found.", reply_markup=main_menu(update.effective_user.id))
+        return
+    name, cur = a.name, a.payout_cut
+    s.close()
+    ctx.user_data['edit_cut_acc'] = arg
+    rows = [
+        [("10%", "cut_set", "10"), ("15%", "cut_set", "15"), ("20%", "cut_set", "20")],
+        [("25%", "cut_set", "25"), ("30%", "cut_set", "30")],
+        [("✏ Custom %", "cut_custom", None)],
+        [("⬅ Back to Menu", "main", None)],
+    ]
+    await update.message.reply_text(
+        f"Change prop cut for {name}\nCurrent: {cur:.0f}%\nPick a preset or Custom:",
+        reply_markup=screen(ctx, rows),
+    )
+
+
+async def act_cut_set(update, ctx, arg):
+    aid = ctx.user_data.get('edit_cut_acc')
+    if not aid:
+        await update.message.reply_text("Session expired.", reply_markup=main_menu(update.effective_user.id))
+        return
+    val = float(arg)
+    s = Session()
+    a = s.query(Account).get(aid)
+    if not a:
+        s.close()
+        await update.message.reply_text("Account not found.", reply_markup=main_menu(update.effective_user.id))
+        return
+    a.payout_cut = val
+    name = a.name
+    s.commit()
+    s.close()
+    ctx.user_data.clear()
+    await update.message.reply_text(f"✅ {name} prop cut set to {val:.0f}%", reply_markup=main_menu(update.effective_user.id))
+
+
+async def act_cut_custom(update, ctx, arg):
+    if not ctx.user_data.get('edit_cut_acc'):
+        await update.message.reply_text("Session expired.", reply_markup=main_menu(update.effective_user.id))
+        return
+    ctx.user_data['mode'] = 'edit_cut'
+    await update.message.reply_text("Send new cut % (e.g. 15 or 22.5):", reply_markup=back_menu(ctx))
 
 async def act_archive(update, ctx, arg):
     s = Session()
@@ -966,6 +1055,9 @@ DISPATCH = {
     "add_live": act_add_live,
     "add_challenge": act_add_challenge,
     "cut": act_cut,
+    "cut_edit": act_cut_edit,
+    "cut_set": act_cut_set,
+    "cut_custom": act_cut_custom,
     "archive": act_archive,
     "delacc": act_delacc,
     "pair_add": act_pair_add,
@@ -1067,6 +1159,25 @@ async def text_handler(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         s.commit()
         ctx.user_data.clear()
         await update.message.reply_text(f"✅ Deposited ${amt}", reply_markup=main_menu(update.effective_user.id))
+    elif mode == 'edit_cut':
+        try:
+            val = float(txt)
+        except ValueError:
+            await update.message.reply_text("Please send a number like 15 or 22.5", reply_markup=back_menu(ctx))
+            s.close()
+            return
+        aid = ctx.user_data.get('edit_cut_acc')
+        acc = s.query(Account).get(aid) if aid else None
+        if not acc:
+            s.close()
+            ctx.user_data.clear()
+            await update.message.reply_text("Session expired.", reply_markup=main_menu(update.effective_user.id))
+            return
+        acc.payout_cut = val
+        name = acc.name
+        s.commit()
+        ctx.user_data.clear()
+        await update.message.reply_text(f"✅ {name} prop cut set to {val:.0f}%", reply_markup=main_menu(update.effective_user.id))
     elif mode == 'pair_add':
         sym = txt.upper().replace("/", "")
         s.add(Pair(user_id=u.id, symbol=sym))
@@ -1167,6 +1278,7 @@ def main():
     app = Application.builder().token(os.getenv("TELEGRAM_BOT_TOKEN")).build()
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("clear", clear_cmd))
+    app.add_handler(CommandHandler("fixfees", fixfees_cmd))
     app.add_handler(CommandHandler("pairs", cmd_pairs))
     # Persistent main-menu reply buttons
     app.add_handler(MessageHandler(filters.Regex("^📝 Log Trade$"), txt_log))
