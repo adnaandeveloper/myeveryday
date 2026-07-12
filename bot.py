@@ -613,14 +613,31 @@ async def act_profit_history(update, ctx, arg):
     s = Session()
     u = get_user(update.effective_user.id)
     txs = s.query(CashTx).filter_by(user_id=u.id).order_by(CashTx.date.desc()).limit(20).all()
-    msg = "📜 Bank History\n(Tap a row to edit/delete)\n"
+    if not txs:
+        s.close()
+        await update.message.reply_text("No transactions", reply_markup=back_wallet(ctx))
+        return
+    lines = ["📜 Bank History", ""]
+    for t in txs:
+        lines.append(f"{t.date.strftime('%d/%m %H:%M')}  {t.type:<8} {t.amount:+.2f}  {t.note or ''}")
+    s.close()
+    rows = [
+        [("✏ Edit Entry", "tx_pick", None)],
+        [("⬅ Back to Wallet", "wallet", None)],
+    ]
+    await update.message.reply_text("\n".join(lines), reply_markup=screen(ctx, rows))
+
+async def act_tx_pick(update, ctx, arg):
+    s = Session()
+    u = get_user(update.effective_user.id)
+    txs = s.query(CashTx).filter_by(user_id=u.id).order_by(CashTx.date.desc()).limit(20).all()
     rows = []
     for t in txs:
         label = f"{t.date.strftime('%d/%m')} {t.type} {t.amount:+.2f}"
-        rows.append([(f"✏ {label}", "tx_view", t.id)])
-    rows.append([("⬅ Back to Wallet", "wallet", None)])
+        rows.append([(label, "tx_view", t.id)])
+    rows.append([("⬅ Back to History", "profit_history", None)])
     s.close()
-    await update.message.reply_text(msg if txs else "No transactions", reply_markup=screen(ctx, rows))
+    await update.message.reply_text("Pick a transaction to edit:", reply_markup=screen(ctx, rows))
 
 async def act_tx_view(update, ctx, arg):
     s = Session()
@@ -1098,6 +1115,7 @@ DISPATCH = {
     "profit_payout": act_profit_payout,
     "profit_stats": act_profit_stats,
     "profit_history": act_profit_history,
+    "tx_pick": act_tx_pick,
     "tx_view": act_tx_view,
     "tx_edit_amt": act_tx_edit_amt,
     "tx_edit_note": act_tx_edit_note,
@@ -1209,13 +1227,14 @@ async def text_handler(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             rows = [[("10%", "cut", "10"), ("20%", "cut", "20")]]
             await update.message.reply_text("Prop cut %?", reply_markup=screen(ctx, rows))
     elif mode == 'withdraw':
-        amt = float(txt)
+        amt = abs(float(txt))
         acc = s.query(Account).get(ctx.user_data['wd_acc'])
         acc.current_balance -= amt
+        # withdraw = money into YOUR pocket → stored POSITIVE (adds to bank balance)
         s.add(CashTx(user_id=u.id, type='WITHDRAW', amount=amt, note=f"From {acc.name}"))
         s.commit()
         ctx.user_data.clear()
-        await update.message.reply_text(f"✅ Withdrew ${amt}", reply_markup=main_menu(update.effective_user.id))
+        await update.message.reply_text(f"✅ Withdrew ${amt:.2f}", reply_markup=main_menu(update.effective_user.id))
     elif mode == 'payout':
         gross = float(txt)
         acc = s.query(Account).get(ctx.user_data['payout_acc'])
