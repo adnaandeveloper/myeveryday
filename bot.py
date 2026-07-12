@@ -71,7 +71,7 @@ class CashTx(Base):
     __tablename__ = 'cash_txs'
     id = Column(String, primary_key=True, default=uid)
     user_id = Column(String, ForeignKey('users.id'))
-    type = Column(String)
+    type = Column(String) # FEE, DEPOSIT, PAYOUT, WITHDRAW, ADJUST, INITIAL
     amount = Column(Float)
     note = Column(Text)
     date = Column(DateTime, default=datetime.utcnow)
@@ -135,7 +135,9 @@ def back_tools():
     return InlineKeyboardMarkup([[InlineKeyboardButton("⬅ Back to Wallet", callback_data="menu_profit")]])
 
 def profit_menu():
+    # UPDATED: Added Starting Balance button for Option 1
     return InlineKeyboardMarkup([
+        [InlineKeyboardButton("📉 Starting Balance", callback_data="profit_starting")],
         [InlineKeyboardButton("💳 Challenge Buy", callback_data="profit_challenge"), InlineKeyboardButton("💰 Live Deposit", callback_data="profit_deposit")],
         [InlineKeyboardButton("💸 Log Payout", callback_data="profit_payout"), InlineKeyboardButton("💵 Withdraw", callback_data="profit_withdraw")],
         [InlineKeyboardButton("📊 View Stats", callback_data="profit_stats"), InlineKeyboardButton("🗑 Edit/Delete", callback_data="profit_edit")],
@@ -217,7 +219,7 @@ async def menu_cb(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         s.close()
         return await close_start(q, ctx)
     if d == "menu_balance":
-        net = sum(t.amount for t in s.query(CashTx).filter_by(user_id=u.id)) or 0
+        net = s.query(func.sum(CashTx.amount)).filter_by(user_id=u.id).scalar() or 0
         s.close()
         kb = [[InlineKeyboardButton("✏ Edit", callback_data="bal_edit"), InlineKeyboardButton("🔄 Reset", callback_data="bal_reset")], [InlineKeyboardButton("⬅ Back", callback_data="back_main")]]
         await q.edit_message_text(f"💰 Bank Balance: ${net:.2f}", reply_markup=InlineKeyboardMarkup(kb))
@@ -296,6 +298,23 @@ async def profit_cb(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     d = q.data
     s = Session()
     u = get_user(q.from_user.id)
+
+    if d == "profit_starting":
+        init = s.query(func.sum(CashTx.amount)).filter_by(user_id=u.id, type='INITIAL').scalar() or 0
+        s.close()
+        ctx.user_data['mode'] = 'starting_balance'
+        await q.edit_message_text(
+            f"📉 Current Starting Balance: ${init:+.2f}\n\n"
+            "Send your REAL P/L before using this bot.\n\n"
+            "Examples:\n"
+            "-10000 -> you lost 10k last year (bank will start at -10k)\n"
+            "0 -> fresh start\n"
+            "3500 -> you were up 3.5k before\n\n"
+            "Just send the number:",
+            reply_markup=back_tools()
+        )
+        return
+
     if d == "profit_withdraw":
         accs = s.query(Account).filter_by(user_id=u.id, status='ACTIVE').all()
         kb = [[InlineKeyboardButton(a.name, callback_data=f"wd_{a.id}")] for a in accs]
@@ -320,8 +339,19 @@ async def profit_cb(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         deposits = s.query(func.sum(CashTx.amount)).filter_by(user_id=u.id, type='DEPOSIT').scalar() or 0
         payouts = s.query(func.sum(CashTx.amount)).filter_by(user_id=u.id, type='PAYOUT').scalar() or 0
         withdraws = s.query(func.sum(CashTx.amount)).filter_by(user_id=u.id, type='WITHDRAW').scalar() or 0
-        net = fees + payouts + withdraws + deposits
-        await q.edit_message_text(f"📊 Stats\nFees: ${abs(fees):.2f}\nLive Capital: ${abs(deposits):.2f}\nPayouts: ${payouts:.2f}\nWithdraws: ${abs(withdraws):.2f}\nNet: ${net:.2f}", reply_markup=back_tools())
+        initial = s.query(func.sum(CashTx.amount)).filter_by(user_id=u.id, type='INITIAL').scalar() or 0
+        net = s.query(func.sum(CashTx.amount)).filter_by(user_id=u.id).scalar() or 0
+        await q.edit_message_text(
+            f"📊 Stats\n"
+            f"Starting (Old): ${initial:+.2f}\n"
+            f"Fees: ${abs(fees):.2f}\n"
+            f"Live Capital: ${abs(deposits):.2f}\n"
+            f"Payouts: ${payouts:.2f}\n"
+            f"Withdraws: ${abs(withdraws):.2f}\n"
+            f"-----------------\n"
+            f"Net Real: ${net:.2f}",
+            reply_markup=back_tools()
+        )
     elif d == "profit_history":
         txs = s.query(CashTx).filter_by(user_id=u.id).order_by(CashTx.date.desc()).limit(20).all()
         msg = "📜 Bank History\n\n"
@@ -515,7 +545,6 @@ async def finalize_trade(src, ctx, comment):
     tr = s.query(Trade).get(tid)
     tr.closed_at = datetime.utcnow()
     tr.close_comment = comment
-
     for acc_id, pnl in ctx.user_data['close']['tas'].items():
         ta = s.query(TradeAccount).filter_by(trade_id=tid, account_id=acc_id).first()
         ta.pnl_usd = pnl
@@ -523,23 +552,18 @@ async def finalize_trade(src, ctx, comment):
         ta.closed_at = datetime.utcnow()
         acc = s.query(Account).get(acc_id)
         acc.current_balance += pnl
-
     s.commit()
     s.close()
-
     if hasattr(src, 'from_user'):
         chat = src.message
         user_id = src.from_user.id
     else:
         chat = src.effective_message
         user_id = src.effective_user.id
-
     ctx.user_data.clear()
-
     txt = "✅ Trade closed"
     if comment:
         txt += f"\n💬 {comment}"
-
     await chat.reply_text(txt, reply_markup=main_menu(user_id))
 
 async def journal_month_cb(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
@@ -666,7 +690,7 @@ async def txt_rules(update, ctx):
         msg = "📏 My Rules\n\n" + "\n\n".join([f"{i}. {r.text}" for i, r in enumerate(rules, 1)])
     kb = []
     for r in rules:
-        kb.append([InlineKeyboardButton("✏️", callback_data=f"rule_edit_{r.id}"), InlineKeyboardButton("🗑️", callback_data=f"rule_del_{r.id}")])
+        kb.append([InlineKeyboardButton("✏", callback_data=f"rule_edit_{r.id}"), InlineKeyboardButton("🗑", callback_data=f"rule_del_{r.id}")])
     kb.append([InlineKeyboardButton("➕ Add Rule", callback_data="rule_add")])
     kb.append([InlineKeyboardButton("⬅ Back", callback_data="back_main")])
     await update.message.reply_text(msg, reply_markup=InlineKeyboardMarkup(kb))
@@ -679,7 +703,7 @@ async def rules_cb(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     u = get_user(q.from_user.id)
     if data == "rule_add":
         ctx.user_data['mode'] = 'rule_add'
-        await q.edit_message_text("✍️ Send your new trading rule:", reply_markup=back_button())
+        await q.edit_message_text("✍ Send your new trading rule:", reply_markup=back_button())
         s.close()
         return
     elif data.startswith("rule_edit_"):
@@ -703,7 +727,7 @@ async def rules_cb(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         msg = "📏 My Rules\n\n" + "\n\n".join([f"{i}. {r.text}" for i, r in enumerate(rules, 1)])
     kb = []
     for r in rules:
-        kb.append([InlineKeyboardButton("✏️", callback_data=f"rule_edit_{r.id}"), InlineKeyboardButton("🗑️", callback_data=f"rule_del_{r.id}")])
+        kb.append([InlineKeyboardButton("✏", callback_data=f"rule_edit_{r.id}"), InlineKeyboardButton("🗑", callback_data=f"rule_del_{r.id}")])
     kb.append([InlineKeyboardButton("➕ Add Rule", callback_data="rule_add")])
     kb.append([InlineKeyboardButton("⬅ Back", callback_data="back_main")])
     await q.edit_message_text(msg, reply_markup=InlineKeyboardMarkup(kb))
@@ -713,6 +737,22 @@ async def text_handler(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     txt = update.message.text.strip()
     s = Session()
     u = get_user(update.effective_user.id)
+
+    if mode == 'starting_balance':
+        try:
+            amt = float(txt.replace(',', '').replace('$','').replace('+',''))
+        except:
+            await update.message.reply_text("❌ Send a number like -10000 or 5000", reply_markup=back_tools())
+            s.close()
+            return
+        s.query(CashTx).filter_by(user_id=u.id, type='INITIAL').delete()
+        s.add(CashTx(user_id=u.id, type='INITIAL', amount=amt, note='Starting balance (old PnL before bot)'))
+        s.commit()
+        s.close()
+        ctx.user_data.clear()
+        await update.message.reply_text(f"✅ Starting balance set to ${amt:+.2f}\nYour Bank Balance now includes this. Check 💰 Balance", reply_markup=main_menu(update.effective_user.id))
+        return
+
     if mode == 'new_acc':
         step = ctx.user_data.get('step', 1)
         atype = ctx.user_data.get('atype')
@@ -770,7 +810,7 @@ async def text_handler(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(f"✅ Pair {sym}", reply_markup=main_menu(update.effective_user.id))
     elif mode == 'bal_edit':
         new_amt = float(txt)
-        current = sum(t.amount for t in s.query(CashTx).filter_by(user_id=u.id)) or 0
+        current = s.query(func.sum(CashTx.amount)).filter_by(user_id=u.id).scalar() or 0
         s.add(CashTx(user_id=u.id, type='ADJUST', amount=new_amt-current, note='Manual'))
         s.commit()
         ctx.user_data.clear()
@@ -843,14 +883,7 @@ async def photo_handler(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         tr.after_photo = update.message.photo[-1].file_id
         s.commit()
         ctx.user_data['close']['step'] = 'result'
-        await update.message.reply_text(
-            "Close as?",
-            reply_markup=InlineKeyboardMarkup([[
-                InlineKeyboardButton("SL ❌", callback_data="res_SL"),
-                InlineKeyboardButton("BE ➖", callback_data="res_BE"),
-                InlineKeyboardButton("TP ✅", callback_data="res_TP")
-            ]])
-        )
+        await update.message.reply_text("Close as?", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("SL ❌", callback_data="res_SL"), InlineKeyboardButton("BE ➖", callback_data="res_BE"), InlineKeyboardButton("TP ✅", callback_data="res_TP")]]))
     s.close()
 
 async def txt_log(update, ctx):
@@ -883,7 +916,7 @@ async def txt_close(update, ctx):
 async def txt_balance(update, ctx):
     s = Session()
     u = get_user(update.effective_user.id)
-    net = sum(t.amount for t in s.query(CashTx).filter_by(user_id=u.id)) or 0
+    net = s.query(func.sum(CashTx.amount)).filter_by(user_id=u.id).scalar() or 0
     s.close()
     await update.message.reply_text(f"💰 Bank Balance: ${net:.2f}", reply_markup=back_button())
 
@@ -896,12 +929,7 @@ async def txt_accounts(update, ctx):
     await update.message.reply_text(msg or "No accounts", reply_markup=back_button())
 
 async def txt_analyse(update, ctx):
-    kb = [
-        [InlineKeyboardButton("📅 Today", callback_data="analyse_today"), InlineKeyboardButton("📆 This Week", callback_data="analyse_week")],
-        [InlineKeyboardButton("🗓 This Month", callback_data="analyse_month"), InlineKeyboardButton("📆 Last Month", callback_data="analyse_lastmonth")],
-        [InlineKeyboardButton("📈 This Year", callback_data="analyse_year"), InlineKeyboardButton("🌍 All Time", callback_data="analyse_all")],
-        [InlineKeyboardButton("⬅ Back", callback_data="back_main")]
-    ]
+    kb = [[InlineKeyboardButton("📅 Today", callback_data="analyse_today"), InlineKeyboardButton("📆 This Week", callback_data="analyse_week")], [InlineKeyboardButton("🗓 This Month", callback_data="analyse_month"), InlineKeyboardButton("📆 Last Month", callback_data="analyse_lastmonth")], [InlineKeyboardButton("📈 This Year", callback_data="analyse_year"), InlineKeyboardButton("🌍 All Time", callback_data="analyse_all")], [InlineKeyboardButton("⬅ Back", callback_data="back_main")]]
     msg = "📊 Analyse - Choose period"
     if hasattr(update, 'callback_query') and update.callback_query:
         await update.callback_query.edit_message_text(msg, reply_markup=InlineKeyboardMarkup(kb))
@@ -915,7 +943,6 @@ async def analyse_period_cb(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     s = Session()
     u = get_user(q.from_user.id)
     now = datetime.utcnow()
-
     if period == 'today':
         start = now.replace(hour=0, minute=0, second=0, microsecond=0)
         end = now
@@ -941,17 +968,14 @@ async def analyse_period_cb(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         start = None
         end = None
         label = "ALL TIME"
-
     query = s.query(Trade).filter_by(user_id=u.id).filter(Trade.closed_at!= None)
     if start:
         query = query.filter(Trade.closed_at >= start)
     if end and period!= 'all':
         query = query.filter(Trade.closed_at <= end)
     trades = query.all()
-
     trade_ids = [t.id for t in trades]
     tas = s.query(TradeAccount).filter(TradeAccount.trade_id.in_(trade_ids)).filter(TradeAccount.pnl_usd!= None).all() if trade_ids else []
-
     total_trades = len(trades)
     wins = len([t for t in tas if t.pnl_usd > 0])
     losses = len([t for t in tas if t.pnl_usd < 0])
@@ -959,33 +983,21 @@ async def analyse_period_cb(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     total_pnl = sum(t.pnl_usd for t in tas) if tas else 0
     avg_win = sum(t.pnl_usd for t in tas if t.pnl_usd > 0) / wins if wins else 0
     avg_loss = sum(t.pnl_usd for t in tas if t.pnl_usd < 0) / losses if losses else 0
-
     tp = len([t for t in tas if t.result == 'TP'])
     sl = len([t for t in tas if t.result == 'SL'])
     be = len([t for t in tas if t.result == 'BE'])
-
     pair_pnl = {}
     for tr in trades:
         for ta in [x for x in tas if x.trade_id == tr.id]:
             pair_pnl[tr.symbol] = pair_pnl.get(tr.symbol, 0) + (ta.pnl_usd or 0)
-
     best = max(pair_pnl.items(), key=lambda x: x[1]) if pair_pnl else ("-", 0)
     worst = min(pair_pnl.items(), key=lambda x: x[1]) if pair_pnl else ("-", 0)
-
     s.close()
-
     date_str = f"{start.strftime('%d %b')} - {end.strftime('%d %b')}" if start and period!= 'all' else ""
-
-    msg = f"📊 {label} {date_str}\n\n"
-    msg += f"Trades: {total_trades}\n"
-    msg += f"Win Rate: {winrate:.1f}% ({wins}W/{losses}L)\n"
-    msg += f"Total PnL: ${total_pnl:+.2f}\n"
+    msg = f"📊 {label} {date_str}\n\nTrades: {total_trades}\nWin Rate: {winrate:.1f}% ({wins}W/{losses}L)\nTotal PnL: ${total_pnl:+.2f}\n"
     if wins or losses:
         msg += f"Avg Win: ${avg_win:.0f} | Avg Loss: ${avg_loss:.0f}\n"
-    msg += f"\nBest: {best[0]} (${best[1]:+.0f})\n"
-    msg += f"Worst: {worst[0]} (${worst[1]:+.0f})\n\n"
-    msg += f"✅ TP:{tp} ❌ SL:{sl} ➖ BE:{be}"
-
+    msg += f"\nBest: {best[0]} (${best[1]:+.0f})\nWorst: {worst[0]} (${worst[1]:+.0f})\n\n✅ TP:{tp} ❌ SL:{sl} ➖ BE:{be}"
     await q.edit_message_text(msg, reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("⬅ Back", callback_data="menu_analyse")]]))
 
 async def txt_journal(update, ctx):
@@ -1040,12 +1052,7 @@ async def txt_admin(update, ctx):
     await update.message.reply_text("👑 ADMIN", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("👥 Users", callback_data="admin_users")]]))
 
 async def txt_gallery(update, ctx):
-    kb = [
-        [InlineKeyboardButton("📅 Today", callback_data="gallery_today"), InlineKeyboardButton("📆 This Week", callback_data="gallery_week")],
-        [InlineKeyboardButton("🗓 This Month", callback_data="gallery_month"), InlineKeyboardButton("📈 This Year", callback_data="gallery_year")],
-        [InlineKeyboardButton("🌍 All Trades", callback_data="gallery_all")],
-        [InlineKeyboardButton("⬅ Back", callback_data="back_main")]
-    ]
+    kb = [[InlineKeyboardButton("📅 Today", callback_data="gallery_today"), InlineKeyboardButton("📆 This Week", callback_data="gallery_week")], [InlineKeyboardButton("🗓 This Month", callback_data="gallery_month"), InlineKeyboardButton("📈 This Year", callback_data="gallery_year")], [InlineKeyboardButton("🌍 All Trades", callback_data="gallery_all")], [InlineKeyboardButton("⬅ Back", callback_data="back_main")]]
     await update.message.reply_text("🖼 Gallery - Choose period", reply_markup=InlineKeyboardMarkup(kb))
 
 async def gallery_cb(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
@@ -1055,18 +1062,11 @@ async def gallery_cb(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     s = Session()
     u = get_user(q.from_user.id)
     now = datetime.utcnow()
-
     if data == "gallery_back":
         s.close()
-        kb = [
-            [InlineKeyboardButton("📅 Today", callback_data="gallery_today"), InlineKeyboardButton("📆 This Week", callback_data="gallery_week")],
-            [InlineKeyboardButton("🗓 This Month", callback_data="gallery_month"), InlineKeyboardButton("📈 This Year", callback_data="gallery_year")],
-            [InlineKeyboardButton("🌍 All Trades", callback_data="gallery_all")],
-            [InlineKeyboardButton("⬅ Back", callback_data="back_main")]
-        ]
+        kb = [[InlineKeyboardButton("📅 Today", callback_data="gallery_today"), InlineKeyboardButton("📆 This Week", callback_data="gallery_week")], [InlineKeyboardButton("🗓 This Month", callback_data="gallery_month"), InlineKeyboardButton("📈 This Year", callback_data="gallery_year")], [InlineKeyboardButton("🌍 All Trades", callback_data="gallery_all")], [InlineKeyboardButton("⬅ Back", callback_data="back_main")]]
         await q.edit_message_text("🖼 Gallery - Choose period", reply_markup=InlineKeyboardMarkup(kb))
         return
-
     if data == "gallery_today":
         start = now.replace(hour=0, minute=0, second=0, microsecond=0)
         trades = s.query(Trade).filter_by(user_id=u.id).filter(Trade.before_photo!=None, Trade.opened_at >= start).order_by(Trade.opened_at.asc()).all()
@@ -1086,14 +1086,11 @@ async def gallery_cb(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     else:
         trades = s.query(Trade).filter_by(user_id=u.id).filter(Trade.before_photo!=None).order_by(Trade.opened_at.asc()).all()
         label = "All Time"
-
     if not trades:
         s.close()
         await q.edit_message_text(f"🖼 No photos for {label}", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("⬅ Back", callback_data="gallery_back")]]))
         return
-
     await q.edit_message_text(f"🖼 Gallery - {label} ({len(trades)} trades)", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("⬅ Back", callback_data="gallery_back")]]))
-
     for tr in trades:
         ta = s.query(TradeAccount).filter_by(trade_id=tr.id).first()
         result = f" • {ta.result}" if ta and ta.result else ""
