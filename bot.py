@@ -1161,6 +1161,7 @@ async def act_cal_day(update, ctx, arg):
     lines = [header, ""]
     rows = []
     day_pnl = 0.0
+    per_account = {}  # account_id -> [name, pnl, trades_count]
     for tr in trades:
         tas = s.query(TradeAccount).filter_by(trade_id=tr.id).all()
         pnl = sum(ta.pnl_usd or 0 for ta in tas)
@@ -1168,6 +1169,19 @@ async def act_cal_day(update, ctx, arg):
         icon = "🟢" if pnl > 0 else ("🔴" if pnl < 0 else "⚪")
         time_str = tr.closed_at.strftime('%H:%M')
         lines.append(f"{icon} {time_str} {tr.symbol} {tr.direction} {_fmt_pnl_short(pnl)}")
+        # Per-account breakdown for this trade
+        for ta in tas:
+            acc = s.query(Account).get(ta.account_id)
+            acc_name = acc.name if acc else ta.account_id
+            p = ta.pnl_usd or 0
+            sub_icon = "🟢" if p > 0 else ("🔴" if p < 0 else ("⚪" if ta.pnl_usd is not None else "⏳"))
+            status = "" if ta.pnl_usd is not None else " (open)"
+            lines.append(f"   {sub_icon} {acc_name}: {_fmt_pnl_short(p)}{status}")
+            if ta.pnl_usd is not None:
+                cur = per_account.get(ta.account_id, [acc_name, 0.0, 0])
+                cur[1] += p
+                cur[2] += 1
+                per_account[ta.account_id] = cur
         if tr.before_comment:
             lines.append(f"   💬 Before: {tr.before_comment}")
         if tr.close_comment:
@@ -1176,7 +1190,15 @@ async def act_cal_day(update, ctx, arg):
         btn_label = f"🔎 {time_str} {tr.symbol} {_fmt_pnl_short(pnl)}"
         rows.append([(btn_label, "view_trade", tr.id)])
 
-    lines.insert(2, f"Day PnL: ${day_pnl:+.2f}  |  Trades: {len(trades)}")
+    # Per-account daily summary
+    if per_account:
+        lines.append("— By Account —")
+        for _, (name, p, ct) in per_account.items():
+            ic = "🟢" if p > 0 else ("🔴" if p < 0 else "⚪")
+            lines.append(f"{ic} {name}: {_fmt_pnl_short(p)} ({ct} trade{'s' if ct != 1 else ''})")
+        lines.append("")
+
+    lines.insert(2, f"Net Day PnL: ${day_pnl:+.2f}  |  Trades: {len(trades)}")
     lines.insert(3, "")
     rows.append([("⬅ Back to Calendar", "calendar", (year, month))])
     s.close()
