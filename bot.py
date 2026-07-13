@@ -1140,10 +1140,10 @@ async def act_calendar(update, ctx, arg):
     for d in range(1, last_day + 1):
         if d in by_day:
             pnl, ct = by_day[d]
-            emoji = "🟢" if pnl > 0 else ("🔴" if pnl < 0 else "⚪")
+            emoji = "🟢" if pnl > 0 else ("🔴" if pnl < 0 else "🟡")
             label = f"{emoji} {d}\n{_fmt_pnl_short(pnl)}"
         else:
-            label = f"· {d}"
+            label = f"⬜ {d}\n—"
         cells.append((label, "cal_day", (year, month, d)))
     while len(cells) % 7 != 0:
         pad_counter += 1
@@ -1157,6 +1157,7 @@ async def act_calendar(update, ctx, arg):
     total_trades = sum(v[1] for v in by_day.values())
     wins = sum(1 for v in by_day.values() if v[0] > 0)
     losses = sum(1 for v in by_day.values() if v[0] < 0)
+    be = sum(1 for v in by_day.values() if v[0] == 0 and v[1] > 0)
     rows.append([("⬅ Back", "analyse_back", None)])
 
     if acc_id is None:
@@ -1167,8 +1168,9 @@ async def act_calendar(update, ctx, arg):
 
     msg = (
         f"🗓 {header_label}  ·  {scope}\n"
-        f"PnL: ${total_pnl:+.2f}  |  Days ↑{wins} ↓{losses}\n"
+        f"PnL: ${total_pnl:+.2f}  |  🟢{wins}  🔴{losses}  🟡{be}\n"
         f"Trades: {total_trades}\n"
+        f"Legend: 🟢 win  🔴 loss  🟡 BE  ⬜ no trade\n"
         f"Tap any day for details."
     )
     await update.message.reply_text(msg, reply_markup=screen(ctx, rows))
