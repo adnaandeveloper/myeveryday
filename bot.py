@@ -993,20 +993,38 @@ async def act_analyse(update, ctx, arg):
     trades = query.all()
     trade_ids = [t.id for t in trades]
     tas = s.query(TradeAccount).filter(TradeAccount.trade_id.in_(trade_ids)).filter(TradeAccount.pnl_usd != None).all() if trade_ids else []
-    total_trades = len(trades)
-    wins = len([t for t in tas if t.pnl_usd > 0])
-    losses = len([t for t in tas if t.pnl_usd < 0])
-    winrate = (wins / len(tas) * 100) if tas else 0
-    total_pnl = sum(t.pnl_usd for t in tas) if tas else 0
-    avg_win = sum(t.pnl_usd for t in tas if t.pnl_usd > 0) / wins if wins else 0
-    avg_loss = sum(t.pnl_usd for t in tas if t.pnl_usd < 0) / losses if losses else 0
-    tp = len([t for t in tas if t.result == 'TP'])
-    sl = len([t for t in tas if t.result == 'SL'])
-    be = len([t for t in tas if t.result == 'BE'])
-    pair_pnl = {}
+    # Aggregate per-Trade (not per-account) so one trade taken across multiple
+    # accounts counts as a single win/loss.
+    per_trade = {}  # trade_id -> {'pnl': float, 'results': [..], 'symbol': str}
     for tr in trades:
-        for ta in [x for x in tas if x.trade_id == tr.id]:
-            pair_pnl[tr.symbol] = pair_pnl.get(tr.symbol, 0) + (ta.pnl_usd or 0)
+        per_trade[tr.id] = {'pnl': 0.0, 'results': [], 'symbol': tr.symbol}
+    for ta in tas:
+        if ta.trade_id in per_trade:
+            per_trade[ta.trade_id]['pnl'] += (ta.pnl_usd or 0)
+            if ta.result:
+                per_trade[ta.trade_id]['results'].append(ta.result)
+    total_trades = len(trades)
+    wins = sum(1 for v in per_trade.values() if v['pnl'] > 0)
+    losses = sum(1 for v in per_trade.values() if v['pnl'] < 0)
+    decided = wins + losses
+    winrate = (wins / decided * 100) if decided else 0
+    total_pnl = sum(v['pnl'] for v in per_trade.values())
+    avg_win = (sum(v['pnl'] for v in per_trade.values() if v['pnl'] > 0) / wins) if wins else 0
+    avg_loss = (sum(v['pnl'] for v in per_trade.values() if v['pnl'] < 0) / losses) if losses else 0
+    def _trade_result(v):
+        # Pick the most common result across accounts; ties fall back to pnl sign.
+        if v['results']:
+            from collections import Counter
+            return Counter(v['results']).most_common(1)[0][0]
+        if v['pnl'] > 0: return 'TP'
+        if v['pnl'] < 0: return 'SL'
+        return 'BE'
+    tp = sum(1 for v in per_trade.values() if _trade_result(v) == 'TP')
+    sl = sum(1 for v in per_trade.values() if _trade_result(v) == 'SL')
+    be = sum(1 for v in per_trade.values() if _trade_result(v) == 'BE')
+    pair_pnl = {}
+    for v in per_trade.values():
+        pair_pnl[v['symbol']] = pair_pnl.get(v['symbol'], 0) + v['pnl']
     best = max(pair_pnl.items(), key=lambda x: x[1]) if pair_pnl else ("-", 0)
     worst = min(pair_pnl.items(), key=lambda x: x[1]) if pair_pnl else ("-", 0)
     s.close()
