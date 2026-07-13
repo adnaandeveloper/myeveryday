@@ -276,6 +276,7 @@ async def txt_analyse(update, ctx):
         [("📅 Today", "analyse", "today"), ("📆 This Week", "analyse", "week")],
         [("🗓 This Month", "analyse", "month"), ("📆 Last Month", "analyse", "lastmonth")],
         [("📈 This Year", "analyse", "year"), ("🌍 All Time", "analyse", "all")],
+        [("🗓 Calendar", "calendar", None)],
         [("⬅ Back to Menu", "main", None)],
     ]
     await update.message.reply_text("📊 Analyse - Choose period", reply_markup=screen(ctx, rows))
@@ -1039,6 +1040,150 @@ async def act_analyse(update, ctx, arg):
 async def act_analyse_back(update, ctx, arg):
     await txt_analyse(update, ctx)
 
+# ---- Calendar ------------------------------------------------------------
+def _fmt_pnl_short(v):
+    a = abs(v)
+    sign = "+" if v >= 0 else "-"
+    if a >= 1000:
+        return f"{sign}${a/1000:.1f}k"
+    return f"{sign}${a:.0f}"
+
+def _month_pnl_by_day(user_id, year, month):
+    """Return {day:int -> (pnl:float, trade_count:int)} aggregated per-Trade
+    (a trade taken across N accounts still counts as one trade)."""
+    from calendar import monthrange
+    s = Session()
+    last_day = monthrange(year, month)[1]
+    start = datetime(year, month, 1)
+    end = datetime(year, month, last_day, 23, 59, 59)
+    trades = s.query(Trade).filter_by(user_id=user_id).filter(
+        Trade.closed_at != None, Trade.closed_at >= start, Trade.closed_at <= end
+    ).all()
+    tids = [t.id for t in trades]
+    tas = s.query(TradeAccount).filter(TradeAccount.trade_id.in_(tids)).all() if tids else []
+    pnl_per_trade = {}
+    for ta in tas:
+        pnl_per_trade[ta.trade_id] = pnl_per_trade.get(ta.trade_id, 0) + (ta.pnl_usd or 0)
+    by_day = {}
+    for t in trades:
+        d = t.closed_at.day
+        cur_pnl, cur_ct = by_day.get(d, (0.0, 0))
+        by_day[d] = (cur_pnl + pnl_per_trade.get(t.id, 0), cur_ct + 1)
+    s.close()
+    return by_day
+
+async def act_calendar(update, ctx, arg):
+    from calendar import monthrange
+    now = datetime.utcnow()
+    if arg is None:
+        year, month = now.year, now.month
+    else:
+        year, month = arg
+    u = get_user(update.effective_user.id)
+    by_day = _month_pnl_by_day(u.id, year, month)
+    last_day = monthrange(year, month)[1]
+    first_wd = datetime(year, month, 1).weekday()  # Mon=0
+
+    # Prev / Next month
+    pm_y, pm_m = (year, month - 1) if month > 1 else (year - 1, 12)
+    nm_y, nm_m = (year, month + 1) if month < 12 else (year + 1, 1)
+    header_label = f"{calendar.month_name[month]} {year}"
+
+    rows = [[
+        ("◀", "calendar", (pm_y, pm_m)),
+        (header_label, "calendar", (year, month)),
+        ("▶", "calendar", (nm_y, nm_m)),
+    ]]
+
+    # Weekday header row (labels must be unique in nav map)
+    rows.append([(wd, "cal_noop", i) for i, wd in enumerate(
+        ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"]
+    )])
+
+    # Build grid — 6 rows × 7 cols max
+    cells = []  # list of (label, action, arg)
+    pad_counter = 0
+    for _ in range(first_wd):
+        pad_counter += 1
+        cells.append(("▫" * pad_counter, "cal_noop", None))
+    for d in range(1, last_day + 1):
+        if d in by_day:
+            pnl, ct = by_day[d]
+            emoji = "🟢" if pnl > 0 else ("🔴" if pnl < 0 else "⚪")
+            label = f"{emoji} {d}\n{_fmt_pnl_short(pnl)}"
+        else:
+            label = f"· {d}"
+        cells.append((label, "cal_day", (year, month, d)))
+    while len(cells) % 7 != 0:
+        pad_counter += 1
+        cells.append(("▫" * pad_counter, "cal_noop", None))
+
+    for i in range(0, len(cells), 7):
+        rows.append(cells[i:i + 7])
+
+    # Totals
+    total_pnl = sum(v[0] for v in by_day.values())
+    total_trades = sum(v[1] for v in by_day.values())
+    wins = sum(1 for v in by_day.values() if v[0] > 0)
+    losses = sum(1 for v in by_day.values() if v[0] < 0)
+    rows.append([("⬅ Back", "analyse_back", None)])
+
+    msg = (
+        f"🗓 {header_label}\n"
+        f"PnL: ${total_pnl:+.2f}  |  Days ↑{wins} ↓{losses}\n"
+        f"Trades: {total_trades}\n"
+        f"Tap any day for details."
+    )
+    await update.message.reply_text(msg, reply_markup=screen(ctx, rows))
+
+async def act_cal_noop(update, ctx, arg):
+    # Ignore taps on padding / weekday header cells
+    return
+
+async def act_cal_day(update, ctx, arg):
+    year, month, day = arg
+    s = Session()
+    u = get_user(update.effective_user.id)
+    start = datetime(year, month, day, 0, 0, 0)
+    end = datetime(year, month, day, 23, 59, 59)
+    trades = s.query(Trade).filter_by(user_id=u.id).filter(
+        Trade.closed_at != None, Trade.closed_at >= start, Trade.closed_at <= end
+    ).order_by(Trade.closed_at.asc()).all()
+
+    header = f"🗓 {day:02d} {calendar.month_name[month]} {year}"
+    if not trades:
+        s.close()
+        rows = [[("⬅ Back to Calendar", "calendar", (year, month))]]
+        await update.message.reply_text(f"{header}\n\nNo trades on this day.",
+                                        reply_markup=screen(ctx, rows))
+        return
+
+    lines = [header, ""]
+    rows = []
+    day_pnl = 0.0
+    for tr in trades:
+        tas = s.query(TradeAccount).filter_by(trade_id=tr.id).all()
+        pnl = sum(ta.pnl_usd or 0 for ta in tas)
+        day_pnl += pnl
+        icon = "🟢" if pnl > 0 else ("🔴" if pnl < 0 else "⚪")
+        time_str = tr.closed_at.strftime('%H:%M')
+        lines.append(f"{icon} {time_str} {tr.symbol} {tr.direction} {_fmt_pnl_short(pnl)}")
+        if tr.before_comment:
+            lines.append(f"   💬 Before: {tr.before_comment}")
+        if tr.close_comment:
+            lines.append(f"   💬 After: {tr.close_comment}")
+        lines.append("")
+        btn_label = f"🔎 {time_str} {tr.symbol} {_fmt_pnl_short(pnl)}"
+        rows.append([(btn_label, "view_trade", tr.id)])
+
+    lines.insert(2, f"Day PnL: ${day_pnl:+.2f}  |  Trades: {len(trades)}")
+    lines.insert(3, "")
+    rows.append([("⬅ Back to Calendar", "calendar", (year, month))])
+    s.close()
+    await update.message.reply_text("\n".join(lines), reply_markup=screen(ctx, rows))
+
+
+
 async def act_gallery(update, ctx, arg):
     data = arg
     s = Session()
@@ -1169,6 +1314,9 @@ DISPATCH = {
     "view_trade": act_view_trade,
     "analyse": act_analyse,
     "analyse_back": act_analyse_back,
+    "calendar": act_calendar,
+    "cal_day": act_cal_day,
+    "cal_noop": act_cal_noop,
     "gallery": act_gallery,
     "gallery_back": act_gallery_back,
     "admin_users": act_admin_users,
