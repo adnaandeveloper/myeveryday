@@ -1143,7 +1143,7 @@ async def act_calendar(update, ctx, arg):
             emoji = "🟢" if pnl > 0 else ("🔴" if pnl < 0 else "🟡")
             label = f"{emoji} {d}\n{_fmt_pnl_short(pnl)}"
         else:
-            label = f"⬜ {d}\n—"
+            label = f"{d}"
         cells.append((label, "cal_day", (year, month, d)))
     while len(cells) % 7 != 0:
         pad_counter += 1
@@ -1170,7 +1170,7 @@ async def act_calendar(update, ctx, arg):
         f"🗓 {header_label}  ·  {scope}\n"
         f"PnL: ${total_pnl:+.2f}  |  🟢{wins}  🔴{losses}  🟡{be}\n"
         f"Trades: {total_trades}\n"
-        f"Legend: 🟢 win  🔴 loss  🟡 BE  ⬜ no trade\n"
+        f"Legend: 🟢 win  🔴 loss  🟡 BE\n"
         f"Tap any day for details."
     )
     await update.message.reply_text(msg, reply_markup=screen(ctx, rows))
