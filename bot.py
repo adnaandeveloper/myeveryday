@@ -149,6 +149,7 @@ def main_menu(tid=None):
         [KeyboardButton("📈 My Pairs"), KeyboardButton("📜 Trade History")],
         [KeyboardButton("🖼 Gallery"), KeyboardButton("➕ Add Account")],
         [KeyboardButton("📏 My Rules"), KeyboardButton("💰 Wallet & Tools")],
+        [KeyboardButton("🗓 Calendar")],
     ]
     if tid and is_admin(tid):
         rows.append([KeyboardButton("👑 ADMIN PANEL")])
@@ -1048,9 +1049,10 @@ def _fmt_pnl_short(v):
         return f"{sign}${a/1000:.1f}k"
     return f"{sign}${a:.0f}"
 
-def _month_pnl_by_day(user_id, year, month):
-    """Return {day:int -> (pnl:float, trade_count:int)} aggregated per-Trade
-    (a trade taken across N accounts still counts as one trade)."""
+def _month_pnl_by_day(user_id, year, month, account_id=None):
+    """Return {day:int -> (pnl:float, trade_count:int)} aggregated per-Trade.
+    If account_id is given, only include that account's slice of each trade,
+    and only count trades that actually touched that account."""
     from calendar import monthrange
     s = Session()
     last_day = monthrange(year, month)[1]
@@ -1060,17 +1062,28 @@ def _month_pnl_by_day(user_id, year, month):
         Trade.closed_at != None, Trade.closed_at >= start, Trade.closed_at <= end
     ).all()
     tids = [t.id for t in trades]
-    tas = s.query(TradeAccount).filter(TradeAccount.trade_id.in_(tids)).all() if tids else []
+    q = s.query(TradeAccount).filter(TradeAccount.trade_id.in_(tids)) if tids else None
+    if q is not None and account_id is not None:
+        q = q.filter(TradeAccount.account_id == account_id)
+    tas = q.all() if q is not None else []
     pnl_per_trade = {}
+    trades_with_acc = set()
     for ta in tas:
         pnl_per_trade[ta.trade_id] = pnl_per_trade.get(ta.trade_id, 0) + (ta.pnl_usd or 0)
+        trades_with_acc.add(ta.trade_id)
     by_day = {}
     for t in trades:
+        if account_id is not None and t.id not in trades_with_acc:
+            continue
         d = t.closed_at.day
         cur_pnl, cur_ct = by_day.get(d, (0.0, 0))
         by_day[d] = (cur_pnl + pnl_per_trade.get(t.id, 0), cur_ct + 1)
     s.close()
     return by_day
+
+async def txt_calendar(update, ctx):
+    ctx.user_data.pop('mode', None)
+    await act_calendar(update, ctx, None)
 
 async def act_calendar(update, ctx, arg):
     from calendar import monthrange
@@ -1080,7 +1093,8 @@ async def act_calendar(update, ctx, arg):
     else:
         year, month = arg
     u = get_user(update.effective_user.id)
-    by_day = _month_pnl_by_day(u.id, year, month)
+    acc_id = ctx.user_data.get('cal_account_id')  # None = All
+    by_day = _month_pnl_by_day(u.id, year, month, acc_id)
     last_day = monthrange(year, month)[1]
     first_wd = datetime(year, month, 1).weekday()  # Mon=0
 
@@ -1094,6 +1108,23 @@ async def act_calendar(update, ctx, arg):
         (header_label, "calendar", (year, month)),
         ("▶", "calendar", (nm_y, nm_m)),
     ]]
+
+    # Account filter row(s)
+    s = Session()
+    accs = s.query(Account).filter_by(user_id=u.id, status='ACTIVE').all()
+    s.close()
+    all_label = ("✅ 👥 All" if acc_id is None else "👥 All")
+    acc_row = [(all_label, "cal_pick_acc", 0)]
+    filter_rows = []
+    for a in accs:
+        mark = "✅ " if acc_id == a.id else ""
+        acc_row.append((f"{mark}{a.name}", "cal_pick_acc", a.id))
+        if len(acc_row) >= 3:
+            filter_rows.append(acc_row)
+            acc_row = []
+    if acc_row:
+        filter_rows.append(acc_row)
+    rows.extend(filter_rows)
 
     # Weekday header row (labels must be unique in nav map)
     rows.append([(wd, "cal_noop", i) for i, wd in enumerate(
@@ -1128,13 +1159,24 @@ async def act_calendar(update, ctx, arg):
     losses = sum(1 for v in by_day.values() if v[0] < 0)
     rows.append([("⬅ Back", "analyse_back", None)])
 
+    if acc_id is None:
+        scope = "All Accounts"
+    else:
+        acc_name = next((a.name for a in accs if a.id == acc_id), f"#{acc_id}")
+        scope = acc_name
+
     msg = (
-        f"🗓 {header_label}\n"
+        f"🗓 {header_label}  ·  {scope}\n"
         f"PnL: ${total_pnl:+.2f}  |  Days ↑{wins} ↓{losses}\n"
         f"Trades: {total_trades}\n"
         f"Tap any day for details."
     )
     await update.message.reply_text(msg, reply_markup=screen(ctx, rows))
+
+async def act_cal_pick_acc(update, ctx, arg):
+    # arg = 0 for All, else account_id
+    ctx.user_data['cal_account_id'] = None if arg == 0 else arg
+    await act_calendar(update, ctx, None)
 
 async def act_cal_noop(update, ctx, arg):
     # Ignore taps on padding / weekday header cells
@@ -1144,13 +1186,19 @@ async def act_cal_day(update, ctx, arg):
     year, month, day = arg
     s = Session()
     u = get_user(update.effective_user.id)
+    acc_id = ctx.user_data.get('cal_account_id')
     start = datetime(year, month, day, 0, 0, 0)
     end = datetime(year, month, day, 23, 59, 59)
     trades = s.query(Trade).filter_by(user_id=u.id).filter(
         Trade.closed_at != None, Trade.closed_at >= start, Trade.closed_at <= end
     ).order_by(Trade.closed_at.asc()).all()
 
-    header = f"🗓 {day:02d} {calendar.month_name[month]} {year}"
+    scope = "All Accounts"
+    if acc_id is not None:
+        acc_row = s.query(Account).get(acc_id)
+        scope = acc_row.name if acc_row else f"#{acc_id}"
+
+    header = f"🗓 {day:02d} {calendar.month_name[month]} {year}  ·  {scope}"
     if not trades:
         s.close()
         rows = [[("⬅ Back to Calendar", "calendar", (year, month))]]
@@ -1162,8 +1210,16 @@ async def act_cal_day(update, ctx, arg):
     rows = []
     day_pnl = 0.0
     per_account = {}  # account_id -> [name, pnl, trades_count]
+    shown_trades = 0
     for tr in trades:
-        tas = s.query(TradeAccount).filter_by(trade_id=tr.id).all()
+        tas_all = s.query(TradeAccount).filter_by(trade_id=tr.id).all()
+        if acc_id is not None:
+            tas = [ta for ta in tas_all if ta.account_id == acc_id]
+            if not tas:
+                continue
+        else:
+            tas = tas_all
+        shown_trades += 1
         pnl = sum(ta.pnl_usd or 0 for ta in tas)
         day_pnl += pnl
         icon = "🟢" if pnl > 0 else ("🔴" if pnl < 0 else "⚪")
@@ -1191,18 +1247,19 @@ async def act_cal_day(update, ctx, arg):
         rows.append([(btn_label, "view_trade", tr.id)])
 
     # Per-account daily summary
-    if per_account:
+    if per_account and acc_id is None:
         lines.append("— By Account —")
         for _, (name, p, ct) in per_account.items():
             ic = "🟢" if p > 0 else ("🔴" if p < 0 else "⚪")
             lines.append(f"{ic} {name}: {_fmt_pnl_short(p)} ({ct} trade{'s' if ct != 1 else ''})")
         lines.append("")
 
-    lines.insert(2, f"Net Day PnL: ${day_pnl:+.2f}  |  Trades: {len(trades)}")
+    lines.insert(2, f"Net Day PnL: ${day_pnl:+.2f}  |  Trades: {shown_trades}")
     lines.insert(3, "")
     rows.append([("⬅ Back to Calendar", "calendar", (year, month))])
     s.close()
     await update.message.reply_text("\n".join(lines), reply_markup=screen(ctx, rows))
+
 
 
 
@@ -1339,6 +1396,7 @@ DISPATCH = {
     "calendar": act_calendar,
     "cal_day": act_cal_day,
     "cal_noop": act_cal_noop,
+    "cal_pick_acc": act_cal_pick_acc,
     "gallery": act_gallery,
     "gallery_back": act_gallery_back,
     "admin_users": act_admin_users,
@@ -1600,6 +1658,7 @@ def main():
     app.add_handler(MessageHandler(filters.Regex("^💰 Wallet & Tools$"), txt_profit))
     app.add_handler(MessageHandler(filters.Regex("^👑 ADMIN PANEL$"), txt_admin))
     app.add_handler(MessageHandler(filters.Regex("^📏 My Rules$"), txt_rules))
+    app.add_handler(MessageHandler(filters.Regex("^🗓 Calendar$"), txt_calendar))
     # Photos and everything else (sub-menu taps + typed input)
     app.add_handler(MessageHandler(filters.PHOTO, photo_handler))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, text_handler))
