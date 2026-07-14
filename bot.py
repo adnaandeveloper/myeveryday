@@ -58,6 +58,7 @@ class Trade(Base):
     before_comment = Column(Text)
     opened_at = Column(DateTime, default=datetime.utcnow)
     closed_at = Column(DateTime)
+    close_reason = Column(String)  # price exit reason: SL / BE / TP. Account result is based on net PnL.
 
 class TradeAccount(Base):
     __tablename__ = 'trade_accounts'
@@ -94,6 +95,10 @@ try:
     if 'before_comment' not in cols:
         with engine.connect() as conn:
             conn.execute(text("ALTER TABLE trades ADD COLUMN before_comment TEXT"))
+            conn.commit()
+    if 'close_reason' not in cols:
+        with engine.connect() as conn:
+            conn.execute(text("ALTER TABLE trades ADD COLUMN close_reason VARCHAR"))
             conn.commit()
 except:
     pass
@@ -182,6 +187,28 @@ async def cmd_pairs(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 def fmt_money(v: float) -> str:
     """Format money with the sign in front of the $ sign (-$103.00 not $-103.00)."""
     return f"-${abs(v):.2f}" if v < 0 else f"${v:.2f}"
+
+def result_from_pnl(pnl):
+    """Final trade/account result is always the NET PnL after partial closes."""
+    if pnl is None:
+        return None
+    if pnl > 0:
+        return 'WIN'
+    if pnl < 0:
+        return 'LOSS'
+    return 'BE'
+
+def result_icon_from_pnl(pnl):
+    if pnl is None:
+        return "⏳"
+    if pnl > 0:
+        return "🟢"
+    if pnl < 0:
+        return "🔴"
+    return "🟡"
+
+def close_reason_label(reason):
+    return {'SL': 'SL hit', 'BE': 'BE exit', 'TP': 'TP hit'}.get(reason or '', reason or '-')
 
 async def fixfees_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     """One-shot repair: flip any legacy positive FEE / DEPOSIT rows to negative.
@@ -322,7 +349,7 @@ async def txt_hist(update, ctx):
         tr = s.query(Trade).get(ta.trade_id)
         acc = s.query(Account).get(ta.account_id)
         if tr and ta.pnl_usd is not None:
-            msg += f"{tr.opened_at.strftime('%d %b %Y')} {tr.symbol} {ta.result or ''} ${ta.pnl_usd:+.0f} ({acc.name})\n"
+            msg += f"{tr.opened_at.strftime('%d %b %Y')} {tr.symbol} {result_from_pnl(ta.pnl_usd)} ${ta.pnl_usd:+.0f} ({acc.name})\n"
     s.close()
     ctx.user_data.pop('mode', None)
     await update.message.reply_text(msg or "No history yet", reply_markup=back_menu(ctx))
@@ -435,19 +462,19 @@ async def act_close_trade(update, ctx, arg):
     has_photo = bool(tr and tr.after_photo)
     s.close()
     if has_photo:
-        ctx.user_data['close']['step'] = 'result'
+        ctx.user_data['close']['step'] = 'reason'
         rows = [[("SL ❌", "close_res", "SL"), ("BE ➖", "close_res", "BE"), ("TP ✅", "close_res", "TP")]]
-        await update.message.reply_text("AFTER photo already saved. Close as?", reply_markup=screen(ctx, rows))
+        await update.message.reply_text("AFTER photo already saved. What did price hit?", reply_markup=screen(ctx, rows))
     else:
         await update.message.reply_text("Send AFTER photo", reply_markup=back_menu(ctx))
 
 
 async def act_close_res(update, ctx, arg):
     try:
-        res = arg
+        reason = arg
         if 'close' not in ctx.user_data:
             ctx.user_data['close'] = {}
-        ctx.user_data['close']['result'] = res
+        ctx.user_data['close']['reason'] = reason
         if 'id' not in ctx.user_data['close']:
             await update.message.reply_text("⚠ Session expired. Please select Close Trade again.", reply_markup=back_menu(ctx))
             return
@@ -464,7 +491,7 @@ async def act_close_res(update, ctx, arg):
         await update.message.reply_text(f"Error: {e}", reply_markup=back_menu(ctx))
 
 async def show_close_accounts_menu(update, ctx):
-    res = ctx.user_data['close']['result']
+    reason = ctx.user_data['close']['reason']
     acc_pnls = ctx.user_data['close']['tas']
     s = Session()
     rows = []
@@ -487,7 +514,12 @@ async def show_close_accounts_menu(update, ctx):
     rows.append([("⬅ Back to Menu", "main", None)])
     s.close()
     ctx.user_data['mode'] = 'close'
-    hint = f"{res} hit. Tap each account to set PnL ({filled}/{total} done).\nTap DONE anytime — unfilled accounts stay open."
+    hint = (
+        f"{close_reason_label(reason)}. Tap each account and enter its FINAL NET PnL "
+        f"after partial closes ({filled}/{total} done).\n"
+        f"Example: +50 partial then -30 SL = +20, so that account is a WIN.\n"
+        f"Tap DONE anytime — unfilled accounts stay open."
+    )
     await update.message.reply_text(hint, reply_markup=screen(ctx, rows))
 
 
@@ -500,7 +532,9 @@ async def act_closeacc(update, ctx, arg):
     s.close()
     rows = [[("⬅ Back", "closeacc_back", None)]]
     await update.message.reply_text(
-        f"Enter PnL for {acc.name} (use -50 or +120):\nCurrent: ${acc.current_balance:.2f}",
+        f"Enter FINAL NET PnL for {acc.name} (use -50 or +120):\n"
+        f"Include partial closes. Example: +50 partial then -30 SL = +20.\n"
+        f"Current: ${acc.current_balance:.2f}",
         reply_markup=screen(ctx, rows))
 
 async def act_closeacc_back(update, ctx, arg):
@@ -519,7 +553,9 @@ async def finalize_trade(update, ctx, comment):
     tid = ctx.user_data['close']['id']
     s = Session()
     tr = s.query(Trade).get(tid)
-    result = ctx.user_data['close']['result']
+    reason = ctx.user_data['close'].get('reason')
+    if tr and reason:
+        tr.close_reason = reason
     closed_now = 0
     for acc_id, pnl in ctx.user_data['close']['tas'].items():
         if pnl is None:
@@ -528,7 +564,7 @@ async def finalize_trade(update, ctx, comment):
         if not ta or ta.closed_at is not None:
             continue  # skip already-closed accounts (no double counting)
         ta.pnl_usd = pnl
-        ta.result = result
+        ta.result = result_from_pnl(pnl)
         ta.closed_at = datetime.utcnow()
         acc = s.query(Account).get(acc_id)
         acc.current_balance += pnl
@@ -943,6 +979,8 @@ async def act_view_trade(update, ctx, arg):
     msg = f"📊 {tr.symbol} {tr.direction}\n📅 Opened: {tr.opened_at.strftime('%d %b %Y %H:%M')}\n"
     if tr.closed_at:
         msg += f"🔒 Closed: {tr.closed_at.strftime('%d %b %Y %H:%M')}\n"
+    if tr.close_reason:
+        msg += f"🎯 Exit: {close_reason_label(tr.close_reason)}\n"
     if tr.before_comment:
         msg += f"💬 Before: {tr.before_comment}\n"
     if tr.close_comment:
@@ -954,8 +992,8 @@ async def act_view_trade(update, ctx, arg):
         for ta in tas:
             acc = s.query(Account).get(ta.account_id)
             if ta.pnl_usd is not None:
-                icon = "✅" if ta.pnl_usd > 0 else "❌" if ta.pnl_usd < 0 else "➖"
-                msg += f"{icon} {acc.name}: ${ta.pnl_usd:+.2f} ({ta.result})\n"
+                icon = result_icon_from_pnl(ta.pnl_usd)
+                msg += f"{icon} {acc.name}: ${ta.pnl_usd:+.2f} ({result_from_pnl(ta.pnl_usd)})\n"
             else:
                 msg += f"🟢 {acc.name}: Open\n"
     year = tr.opened_at.year
@@ -987,24 +1025,22 @@ async def act_analyse(update, ctx, arg):
         start = now.replace(month=1, day=1, hour=0, minute=0, second=0, microsecond=0); end = now; label = "THIS YEAR"
     else:
         start = None; end = None; label = "ALL TIME"
-    query = s.query(Trade).filter_by(user_id=u.id).filter(Trade.closed_at != None)
+    ta_query = s.query(TradeAccount).join(Trade).filter(Trade.user_id == u.id).filter(TradeAccount.closed_at != None)
     if start:
-        query = query.filter(Trade.closed_at >= start)
+        ta_query = ta_query.filter(TradeAccount.closed_at >= start)
     if end and period != 'all':
-        query = query.filter(Trade.closed_at <= end)
-    trades = query.all()
-    trade_ids = [t.id for t in trades]
-    tas = s.query(TradeAccount).filter(TradeAccount.trade_id.in_(trade_ids)).filter(TradeAccount.pnl_usd != None).all() if trade_ids else []
+        ta_query = ta_query.filter(TradeAccount.closed_at <= end)
+    tas = ta_query.filter(TradeAccount.pnl_usd != None).all()
+    trade_ids = list({ta.trade_id for ta in tas})
+    trades = s.query(Trade).filter(Trade.id.in_(trade_ids)).all() if trade_ids else []
     # Aggregate per-Trade (not per-account) so one trade taken across multiple
-    # accounts counts as a single win/loss.
-    per_trade = {}  # trade_id -> {'pnl': float, 'results': [..], 'symbol': str}
+    # accounts counts as a single win/loss by total net PnL.
+    per_trade = {}  # trade_id -> {'pnl': float, 'symbol': str}
     for tr in trades:
-        per_trade[tr.id] = {'pnl': 0.0, 'results': [], 'symbol': tr.symbol}
+        per_trade[tr.id] = {'pnl': 0.0, 'symbol': tr.symbol}
     for ta in tas:
         if ta.trade_id in per_trade:
             per_trade[ta.trade_id]['pnl'] += (ta.pnl_usd or 0)
-            if ta.result:
-                per_trade[ta.trade_id]['results'].append(ta.result)
     total_trades = len(trades)
     wins = sum(1 for v in per_trade.values() if v['pnl'] > 0)
     losses = sum(1 for v in per_trade.values() if v['pnl'] < 0)
@@ -1013,17 +1049,7 @@ async def act_analyse(update, ctx, arg):
     total_pnl = sum(v['pnl'] for v in per_trade.values())
     avg_win = (sum(v['pnl'] for v in per_trade.values() if v['pnl'] > 0) / wins) if wins else 0
     avg_loss = (sum(v['pnl'] for v in per_trade.values() if v['pnl'] < 0) / losses) if losses else 0
-    def _trade_result(v):
-        # Pick the most common result across accounts; ties fall back to pnl sign.
-        if v['results']:
-            from collections import Counter
-            return Counter(v['results']).most_common(1)[0][0]
-        if v['pnl'] > 0: return 'TP'
-        if v['pnl'] < 0: return 'SL'
-        return 'BE'
-    tp = sum(1 for v in per_trade.values() if _trade_result(v) == 'TP')
-    sl = sum(1 for v in per_trade.values() if _trade_result(v) == 'SL')
-    be = sum(1 for v in per_trade.values() if _trade_result(v) == 'BE')
+    be = sum(1 for v in per_trade.values() if v['pnl'] == 0)
     pair_pnl = {}
     for v in per_trade.values():
         pair_pnl[v['symbol']] = pair_pnl.get(v['symbol'], 0) + v['pnl']
@@ -1034,7 +1060,7 @@ async def act_analyse(update, ctx, arg):
     msg = f"📊 {label} {date_str}\n\nTrades: {total_trades}\nWin Rate: {winrate:.1f}% ({wins}W/{losses}L)\nTotal PnL: ${total_pnl:+.2f}\n"
     if wins or losses:
         msg += f"Avg Win: ${avg_win:.0f} | Avg Loss: ${avg_loss:.0f}\n"
-    msg += f"\nBest: {best[0]} (${best[1]:+.0f})\nWorst: {worst[0]} (${worst[1]:+.0f})\n\n✅ TP:{tp} ❌ SL:{sl} ➖ BE:{be}"
+    msg += f"\nBest: {best[0]} (${best[1]:+.0f})\nWorst: {worst[0]} (${worst[1]:+.0f})\n\n🟢 WIN:{wins} 🔴 LOSS:{losses} 🟡 BE:{be}"
     rows = [[("⬅ Back", "analyse_back", None)]]
     await update.message.reply_text(msg, reply_markup=screen(ctx, rows))
 
@@ -1050,34 +1076,28 @@ def _fmt_pnl_short(v):
     return f"{sign}${a:.0f}"
 
 def _month_pnl_by_day(user_id, year, month, account_id=None):
-    """Return {day:int -> (pnl:float, trade_count:int)} aggregated per-Trade.
-    If account_id is given, only include that account's slice of each trade,
-    and only count trades that actually touched that account."""
+    """Return {day:int -> (pnl:float, trade_count:int)} from account close rows.
+    Final result is by net PnL, so partial closes are included in pnl_usd."""
     from calendar import monthrange
     s = Session()
     last_day = monthrange(year, month)[1]
     start = datetime(year, month, 1)
     end = datetime(year, month, last_day, 23, 59, 59)
-    trades = s.query(Trade).filter_by(user_id=user_id).filter(
-        Trade.closed_at != None, Trade.closed_at >= start, Trade.closed_at <= end
-    ).all()
-    tids = [t.id for t in trades]
-    q = s.query(TradeAccount).filter(TradeAccount.trade_id.in_(tids)) if tids else None
-    if q is not None and account_id is not None:
+    q = s.query(TradeAccount).join(Trade).filter(
+        Trade.user_id == user_id,
+        TradeAccount.closed_at != None,
+        TradeAccount.closed_at >= start,
+        TradeAccount.closed_at <= end,
+        TradeAccount.pnl_usd != None,
+    )
+    if account_id is not None:
         q = q.filter(TradeAccount.account_id == account_id)
-    tas = q.all() if q is not None else []
-    pnl_per_trade = {}
-    trades_with_acc = set()
-    for ta in tas:
-        pnl_per_trade[ta.trade_id] = pnl_per_trade.get(ta.trade_id, 0) + (ta.pnl_usd or 0)
-        trades_with_acc.add(ta.trade_id)
+    tas = q.all()
     by_day = {}
-    for t in trades:
-        if account_id is not None and t.id not in trades_with_acc:
-            continue
-        d = t.closed_at.day
+    for ta in tas:
+        d = ta.closed_at.day
         cur_pnl, cur_ct = by_day.get(d, (0.0, 0))
-        by_day[d] = (cur_pnl + pnl_per_trade.get(t.id, 0), cur_ct + 1)
+        by_day[d] = (cur_pnl + (ta.pnl_usd or 0), cur_ct + 1)
     s.close()
     return by_day
 
@@ -1191,9 +1211,19 @@ async def act_cal_day(update, ctx, arg):
     acc_id = ctx.user_data.get('cal_account_id')
     start = datetime(year, month, day, 0, 0, 0)
     end = datetime(year, month, day, 23, 59, 59)
-    trades = s.query(Trade).filter_by(user_id=u.id).filter(
-        Trade.closed_at != None, Trade.closed_at >= start, Trade.closed_at <= end
-    ).order_by(Trade.closed_at.asc()).all()
+    ta_day_query = s.query(TradeAccount).join(Trade).filter(
+        Trade.user_id == u.id,
+        TradeAccount.closed_at != None,
+        TradeAccount.closed_at >= start,
+        TradeAccount.closed_at <= end,
+        TradeAccount.pnl_usd != None,
+    )
+    if acc_id is not None:
+        ta_day_query = ta_day_query.filter(TradeAccount.account_id == acc_id)
+    day_tas = ta_day_query.order_by(TradeAccount.closed_at.asc()).all()
+    trade_ids = list(dict.fromkeys([ta.trade_id for ta in day_tas]))
+    trades = s.query(Trade).filter(Trade.id.in_(trade_ids)).all() if trade_ids else []
+    trade_map = {tr.id: tr for tr in trades}
 
     scope = "All Accounts"
     if acc_id is not None:
@@ -1201,7 +1231,7 @@ async def act_cal_day(update, ctx, arg):
         scope = acc_row.name if acc_row else f"#{acc_id}"
 
     header = f"🗓 {day:02d} {calendar.month_name[month]} {year}  ·  {scope}"
-    if not trades:
+    if not day_tas:
         s.close()
         rows = [[("⬅ Back to Calendar", "calendar", (year, month))]]
         await update.message.reply_text(f"{header}\n\nNo trades on this day.",
@@ -1213,8 +1243,11 @@ async def act_cal_day(update, ctx, arg):
     day_pnl = 0.0
     per_account = {}  # account_id -> [name, pnl, trades_count]
     shown_trades = 0
-    for tr in trades:
-        tas_all = s.query(TradeAccount).filter_by(trade_id=tr.id).all()
+    for tid in trade_ids:
+        tr = trade_map.get(tid)
+        if not tr:
+            continue
+        tas_all = [ta for ta in day_tas if ta.trade_id == tid]
         if acc_id is not None:
             tas = [ta for ta in tas_all if ta.account_id == acc_id]
             if not tas:
@@ -1225,7 +1258,7 @@ async def act_cal_day(update, ctx, arg):
         pnl = sum(ta.pnl_usd or 0 for ta in tas)
         day_pnl += pnl
         icon = "🟢" if pnl > 0 else ("🔴" if pnl < 0 else "⚪")
-        time_str = tr.closed_at.strftime('%H:%M')
+        time_str = min(ta.closed_at for ta in tas if ta.closed_at).strftime('%H:%M')
         lines.append(f"{icon} {time_str} {tr.symbol} {tr.direction} {_fmt_pnl_short(pnl)}")
         # Per-account breakdown for this trade
         for ta in tas:
@@ -1296,8 +1329,9 @@ async def act_gallery(update, ctx, arg):
     await update.message.reply_text(f"🖼 Gallery - {label} ({len(trades)} trades)", reply_markup=screen(ctx, [[("⬅ Back", "gallery_back", None)]]))
     for tr in trades:
         ta = s.query(TradeAccount).filter_by(trade_id=tr.id).first()
-        result = f" • {ta.result}" if ta and ta.result else ""
-        base = f"{tr.symbol} {tr.direction} • {tr.opened_at.strftime('%d %b %Y')}{result}"
+        result = f" • {result_from_pnl(ta.pnl_usd)}" if ta and ta.pnl_usd is not None else ""
+        reason = f" • {close_reason_label(tr.close_reason)}" if tr.close_reason else ""
+        base = f"{tr.symbol} {tr.direction} • {tr.opened_at.strftime('%d %b %Y')}{result}{reason}"
         before_cap = "BEFORE: " + base
         if tr.before_comment:
             before_cap += f"\n💬 {tr.before_comment}"
@@ -1631,9 +1665,9 @@ async def photo_handler(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         tr = s.query(Trade).get(tid)
         tr.after_photo = update.message.photo[-1].file_id
         s.commit()
-        ctx.user_data['close']['step'] = 'result'
+        ctx.user_data['close']['step'] = 'reason'
         rows = [[("SL ❌", "close_res", "SL"), ("BE ➖", "close_res", "BE"), ("TP ✅", "close_res", "TP")]]
-        await update.message.reply_text("Close as?", reply_markup=screen(ctx, rows))
+        await update.message.reply_text("What did price hit?", reply_markup=screen(ctx, rows))
     s.close()
 
 # ---------------------------------------------------------------------------
