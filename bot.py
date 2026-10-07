@@ -7,6 +7,7 @@ from telegram.ext import Application, CommandHandler, ContextTypes, MessageHandl
 from sqlalchemy import create_engine, Column, String, Float, DateTime, ForeignKey, Text, UniqueConstraint, func, extract, text, inspect
 from sqlalchemy.orm import declarative_base, sessionmaker
 import uuid
+import json
 import calendar
 from datetime import datetime, timedelta
 
@@ -59,6 +60,10 @@ class Trade(Base):
     opened_at = Column(DateTime, default=datetime.utcnow)
     closed_at = Column(DateTime)
     close_reason = Column(String)  # price exit reason: SL / BE / TP. Account result is based on net PnL.
+    rules_checked = Column(Text)   # JSON {"followed": [...], "missed": [...]} snapshot of rule texts
+    confluences = Column(Text)     # JSON list of what you saw before entry (4H close, 1H rejection ...)
+    r_result = Column(Float)       # actual R made on the trade (+2, -1, 0, +1.5 ...)
+    blew = Column(String)          # '1' if this trade blew a challenge
 
 class TradeAccount(Base):
     __tablename__ = 'trade_accounts'
@@ -85,6 +90,21 @@ class Rule(Base):
     created_at = Column(DateTime, default=datetime.utcnow)
     order_num = Column(Float, default=0)
 
+class Tag(Base):
+    """Confluence / 'what I saw' tags you can tick when logging a trade."""
+    __tablename__ = 'tags'
+    id = Column(String, primary_key=True, default=uid)
+    user_id = Column(String, ForeignKey('users.id'))
+    name = Column(String)
+    created_at = Column(DateTime, default=datetime.utcnow)
+    __table_args__ = (UniqueConstraint('user_id', 'name'),)
+
+DEFAULT_TAGS = [
+    "4H candle close", "4H rejection", "1H rejection",
+    "15m swing H/L", "15m rejection", "In zone / POI",
+    "Liquidity sweep", "Trend aligned",
+]
+
 DATABASE_URL = os.getenv("DATABASE_URL", "sqlite:///./edgeflo.db")
 ADMIN_IDS = os.getenv("ADMIN_IDS", "").split(",")
 engine = create_engine(DATABASE_URL, future=True)
@@ -100,6 +120,11 @@ try:
         with engine.connect() as conn:
             conn.execute(text("ALTER TABLE trades ADD COLUMN close_reason VARCHAR"))
             conn.commit()
+    for col, typ in [('rules_checked', 'TEXT'), ('confluences', 'TEXT'), ('r_result', 'FLOAT'), ('blew', 'VARCHAR')]:
+        if col not in cols:
+            with engine.connect() as conn:
+                conn.execute(text(f"ALTER TABLE trades ADD COLUMN {col} {typ}"))
+                conn.commit()
 except:
     pass
 
@@ -210,6 +235,42 @@ def result_icon_from_pnl(pnl):
 def close_reason_label(reason):
     return {'SL': 'SL hit', 'BE': 'BE exit', 'TP': 'TP hit'}.get(reason or '', reason or '-')
 
+def _short(t, n=30):
+    t = (t or '').replace('\n', ' ').strip()
+    return t if len(t) <= n else t[:n - 1] + '…'
+
+def _loads(v, default):
+    try:
+        return json.loads(v) if v else default
+    except Exception:
+        return default
+
+def trade_r(tr):
+    """R for a closed trade: typed value first, otherwise derived from exit (SL=-1, BE=0, TP=planned R:R)."""
+    if tr.r_result is not None:
+        return tr.r_result
+    if not tr.closed_at:
+        return None
+    if tr.close_reason == 'SL':
+        return -1.0
+    if tr.close_reason == 'BE':
+        return 0.0
+    if tr.close_reason == 'TP' and tr.rr:
+        return float(tr.rr)
+    return None
+
+def get_tags(user_id):
+    s = Session()
+    tags = s.query(Tag).filter_by(user_id=user_id).order_by(Tag.created_at).all()
+    if not tags:
+        for n in DEFAULT_TAGS:
+            s.add(Tag(user_id=user_id, name=n))
+        s.commit()
+        tags = s.query(Tag).filter_by(user_id=user_id).order_by(Tag.created_at).all()
+    names = [t.name for t in tags]
+    s.close()
+    return names
+
 async def fixfees_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     """One-shot repair: flip any legacy positive FEE / DEPOSIT rows to negative.
     FEEs and DEPOSITs are money going OUT of the bank, so they must be stored
@@ -280,6 +341,7 @@ async def txt_accounts(update, ctx):
     u = get_user(update.effective_user.id)
     accs = s.query(Account).filter_by(user_id=u.id, status='ACTIVE').all()
     arch = s.query(Account).filter_by(user_id=u.id, status='ARCHIVED').all()
+    blown = s.query(Account).filter_by(user_id=u.id, status='BLOWN').all()
     msg = "⚙ Active Accounts\n\n"
     for a in accs:
         cut = f" -{a.payout_cut}%" if a.type == 'CHALLENGE' else ""
@@ -287,11 +349,16 @@ async def txt_accounts(update, ctx):
     msg += "\n📦 Archived:\n"
     for a in arch:
         msg += f"• {a.name}\n"
+    if blown:
+        msg += "\n💥 Blown:\n"
+        for a in blown:
+            msg += f"• {a.name}\n"
     rows = []
     for a in accs:
         row = [(f"📦 Archive {a.name}", "archive", a.id)]
         if a.type == 'CHALLENGE':
             row.append((f"✏ Cut {a.name}", "cut_edit", a.id))
+            row.append((f"💥 Blown {a.name}", "blow_acc", a.id))
         rows.append(row)
     rows.append([("⬅ Back to Menu", "main", None)])
     s.close()
@@ -304,7 +371,7 @@ async def txt_analyse(update, ctx):
         [("📅 Today", "analyse", "today"), ("📆 This Week", "analyse", "week")],
         [("🗓 This Month", "analyse", "month"), ("📆 Last Month", "analyse", "lastmonth")],
         [("📈 This Year", "analyse", "year"), ("🌍 All Time", "analyse", "all")],
-        [("🗓 Calendar", "calendar", None)],
+        [("🗓 Calendar", "calendar", None), ("📈 Weekly R", "weekly_r", None)],
         [("⬅ Back to Menu", "main", None)],
     ]
     await update.message.reply_text("📊 Analyse - Choose period", reply_markup=screen(ctx, rows))
@@ -448,6 +515,121 @@ async def act_dir(update, ctx, arg):
     ctx.user_data['trade']['step'] = 'photo'
     await update.message.reply_text("Send BEFORE photo", reply_markup=back_menu(ctx))
 
+# ---- Step 1 after photo: tick the rules you followed ----------------------
+
+async def show_rules_check(update, ctx):
+    u = get_user(update.effective_user.id)
+    s = Session()
+    rules = s.query(Rule).filter_by(user_id=u.id).order_by(Rule.order_num, Rule.created_at).all()
+    s.close()
+    if not rules:
+        return await show_tags_check(update, ctx)
+    checked = set(ctx.user_data.setdefault('rules_checked', []))
+    ctx.user_data['mode'] = 'rules_check'
+    rows, lines = [], []
+    for i, r in enumerate(rules, 1):
+        mark = '✅' if r.id in checked else '⬜'
+        rows.append([(f"{mark} {i}. {_short(r.text)}", "rule_tick", r.id)])
+        lines.append(f"{mark} {i}. {r.text}")
+    rows.append([("☑ Tick All", "rule_tick_all", None), ("➡ Next", "rules_done", None)])
+    msg = "📏 Which rules did you follow on this trade?\n\n" + "\n".join(lines)
+    await update.message.reply_text(msg, reply_markup=screen(ctx, rows))
+
+async def act_rule_tick(update, ctx, arg):
+    checked = ctx.user_data.setdefault('rules_checked', [])
+    if arg in checked:
+        checked.remove(arg)
+    else:
+        checked.append(arg)
+    await show_rules_check(update, ctx)
+
+async def act_rule_tick_all(update, ctx, arg):
+    u = get_user(update.effective_user.id)
+    s = Session()
+    ctx.user_data['rules_checked'] = [r.id for r in s.query(Rule).filter_by(user_id=u.id).all()]
+    s.close()
+    await show_rules_check(update, ctx)
+
+async def act_rules_done(update, ctx, arg):
+    u = get_user(update.effective_user.id)
+    s = Session()
+    rules = s.query(Rule).filter_by(user_id=u.id).order_by(Rule.order_num, Rule.created_at).all()
+    checked = set(ctx.user_data.get('rules_checked', []))
+    data = {"followed": [r.text for r in rules if r.id in checked],
+            "missed": [r.text for r in rules if r.id not in checked]}
+    tr = s.query(Trade).get(ctx.user_data.get('before_trade_id'))
+    if tr:
+        tr.rules_checked = json.dumps(data)
+        s.commit()
+    s.close()
+    if data["missed"]:
+        await update.message.reply_text(f"⚠ You skipped {len(data['missed'])} rule(s). Noted in the journal.")
+    await show_tags_check(update, ctx)
+
+# ---- Step 2: what did you see before entry (confluences) -------------------
+
+async def show_tags_check(update, ctx):
+    u = get_user(update.effective_user.id)
+    tags = get_tags(u.id)
+    picked = ctx.user_data.setdefault('tags_checked', [])
+    ctx.user_data['mode'] = 'tags_check'
+    rows, row = [], []
+    for name in tags:
+        mark = '✅' if name in picked else '⬜'
+        row.append((f"{mark} {name}", "tag_tick", name))
+        if len(row) == 2:
+            rows.append(row); row = []
+    if row:
+        rows.append(row)
+    rows.append([("➡ Next", "tags_done", None)])
+    msg = ("👀 What did you see before entry? Tick all that apply.\n"
+           "✍ Type any other reason to add it (it's saved for next time).")
+    if picked:
+        msg += "\n\nSelected: " + ", ".join(picked)
+    await update.message.reply_text(msg, reply_markup=screen(ctx, rows))
+
+async def act_tag_tick(update, ctx, arg):
+    picked = ctx.user_data.setdefault('tags_checked', [])
+    if arg in picked:
+        picked.remove(arg)
+    else:
+        picked.append(arg)
+    await show_tags_check(update, ctx)
+
+async def act_tags_done(update, ctx, arg):
+    s = Session()
+    tr = s.query(Trade).get(ctx.user_data.get('before_trade_id'))
+    if tr:
+        tr.confluences = json.dumps(ctx.user_data.get('tags_checked', []))
+        s.commit()
+    s.close()
+    await show_rr_pick(update, ctx)
+
+# ---- Step 3: planned R:R ---------------------------------------------------
+
+async def show_rr_pick(update, ctx):
+    ctx.user_data['mode'] = 'rr_pick'
+    rows = [[("1:1", "rr_set", 1.0), ("1:2", "rr_set", 2.0), ("1:3", "rr_set", 3.0)],
+            [("1:4", "rr_set", 4.0), ("1:5", "rr_set", 5.0), ("⏭ Skip R:R", "rr_set", None)]]
+    await update.message.reply_text("🎯 Planned R:R? Tap or type e.g. 2.5 or 1:2.5", reply_markup=screen(ctx, rows))
+
+async def act_rr_set(update, ctx, arg):
+    if arg is not None:
+        s = Session()
+        tr = s.query(Trade).get(ctx.user_data.get('before_trade_id'))
+        if tr:
+            tr.rr = float(arg)
+            s.commit()
+        s.close()
+    await ask_before_comment(update, ctx)
+
+# ---- Step 4: free note -----------------------------------------------------
+
+async def ask_before_comment(update, ctx):
+    ctx.user_data['mode'] = 'await_before_comment'
+    rows = [[("⏭ Skip", "before_skip", None)]]
+    await update.message.reply_text("✍ Add note for BEFORE photo? (optional)", reply_markup=screen(ctx, rows))
+
 # ---------------------------------------------------------------------------
 # Close trade flow
 # ---------------------------------------------------------------------------
@@ -542,6 +724,28 @@ async def act_closeacc_back(update, ctx, arg):
     await show_close_accounts_menu(update, ctx)
 
 async def act_closeacc_done(update, ctx, arg):
+    s = Session()
+    tr = s.query(Trade).get(ctx.user_data['close']['id'])
+    planned = (tr.rr or 0) if tr else 0
+    s.close()
+    reason = ctx.user_data['close'].get('reason')
+    ctx.user_data['mode'] = 'close_r'
+    rows = []
+    if planned > 0:
+        rows.append([(f"✅ +{planned:g}R (full TP)", "r_set", float(planned))])
+    rows.append([("❌ -1R", "r_set", -1.0), ("➖ 0R", "r_set", 0.0)])
+    rows.append([("+0.5R", "r_set", 0.5), ("+1R", "r_set", 1.0), ("+2R", "r_set", 2.0), ("+3R", "r_set", 3.0)])
+    rows.append([("⏭ Skip R", "r_set", None)])
+    hint = f"🎯 How many R did this trade make? ({close_reason_label(reason)})\nTap or type e.g. 1.5 or -0.5"
+    if planned > 0:
+        hint += f"\nPlanned R:R was 1:{planned:g}"
+    await update.message.reply_text(hint, reply_markup=screen(ctx, rows))
+
+async def act_r_set(update, ctx, arg):
+    ctx.user_data['close']['r'] = arg
+    await ask_close_comment(update, ctx)
+
+async def ask_close_comment(update, ctx):
     ctx.user_data['mode'] = 'await_comment'
     rows = [[("⏭ Skip", "comment_skip", None)]]
     await update.message.reply_text("✍ Add closing note? (optional)", reply_markup=screen(ctx, rows))
@@ -556,7 +760,10 @@ async def finalize_trade(update, ctx, comment):
     reason = ctx.user_data['close'].get('reason')
     if tr and reason:
         tr.close_reason = reason
+    if tr and ctx.user_data['close'].get('r') is not None:
+        tr.r_result = float(ctx.user_data['close']['r'])
     closed_now = 0
+    losing_challenges = []
     for acc_id, pnl in ctx.user_data['close']['tas'].items():
         if pnl is None:
             continue  # leave unfilled accounts open
@@ -569,6 +776,8 @@ async def finalize_trade(update, ctx, comment):
         acc = s.query(Account).get(acc_id)
         acc.current_balance += pnl
         closed_now += 1
+        if pnl < 0 and acc.type == 'CHALLENGE':
+            losing_challenges.append((acc.id, acc.name))
     # Only close the whole trade once every account is closed.
     open_remaining = s.query(TradeAccount).filter_by(trade_id=tid, closed_at=None).count()
     if open_remaining == 0:
@@ -584,7 +793,53 @@ async def finalize_trade(update, ctx, comment):
             txt += f"\n💬 {comment}"
     else:
         txt = f"✅ Closed {closed_now} account(s).\n⏳ {open_remaining} still open — pick this trade again in Close Trade to finish."
+    if losing_challenges:
+        await update.message.reply_text(txt)
+        ctx.user_data['blow'] = {'trade_id': tid, 'accs': losing_challenges}
+        await ask_blow(update, ctx)
+        return
     await update.message.reply_text(txt, reply_markup=main_menu(user_id))
+
+async def ask_blow(update, ctx):
+    b = ctx.user_data.get('blow', {})
+    if not b.get('accs'):
+        ctx.user_data.clear()
+        await update.message.reply_text("👍 Saved", reply_markup=main_menu(update.effective_user.id))
+        return
+    rows = [[(f"💥 Blew {name}", "blow", aid)] for aid, name in b['accs']]
+    rows.append([("👍 No, still alive", "blow_no", None)])
+    await update.message.reply_text("💥 Did this trade blow a challenge?", reply_markup=screen(ctx, rows))
+
+async def act_blow(update, ctx, arg):
+    b = ctx.user_data.get('blow', {})
+    s = Session()
+    acc = s.query(Account).get(arg)
+    name = acc.name if acc else '?'
+    if acc:
+        acc.status = 'BLOWN'
+    tr = s.query(Trade).get(b.get('trade_id'))
+    if tr:
+        tr.blew = '1'
+    s.commit()
+    s.close()
+    b['accs'] = [a for a in b.get('accs', []) if a[0] != arg]
+    await update.message.reply_text(f"💥 {name} marked as BLOWN. Shake it off, next one.")
+    await ask_blow(update, ctx)
+
+async def act_blow_no(update, ctx, arg):
+    ctx.user_data.clear()
+    await update.message.reply_text("👍 Good, keep protecting it", reply_markup=main_menu(update.effective_user.id))
+
+async def act_blow_acc(update, ctx, arg):
+    """Mark a challenge as blown from My Accounts."""
+    s = Session()
+    acc = s.query(Account).get(arg)
+    if acc:
+        acc.status = 'BLOWN'
+        s.commit()
+        await update.message.reply_text(f"💥 {acc.name} marked as BLOWN")
+    s.close()
+    await txt_accounts(update, ctx)
 
 
 # ---------------------------------------------------------------------------
@@ -981,6 +1236,21 @@ async def act_view_trade(update, ctx, arg):
         msg += f"🔒 Closed: {tr.closed_at.strftime('%d %b %Y %H:%M')}\n"
     if tr.close_reason:
         msg += f"🎯 Exit: {close_reason_label(tr.close_reason)}\n"
+    if tr.rr:
+        msg += f"🎯 Planned R:R: 1:{tr.rr:g}\n"
+    r = trade_r(tr)
+    if r is not None:
+        msg += f"📐 Result: {r:+.2f}R\n"
+    if tr.blew == '1':
+        msg += "💥 Blew a challenge\n"
+    rc = _loads(tr.rules_checked, None)
+    if rc:
+        msg += f"\n📏 Rules ({len(rc.get('followed', []))}/{len(rc.get('followed', [])) + len(rc.get('missed', []))}):\n"
+        msg += "".join(f"✅ {x}\n" for x in rc.get('followed', []))
+        msg += "".join(f"❌ {x}\n" for x in rc.get('missed', []))
+    tg = _loads(tr.confluences, [])
+    if tg:
+        msg += "👀 Saw: " + ", ".join(tg) + "\n"
     if tr.before_comment:
         msg += f"💬 Before: {tr.before_comment}\n"
     if tr.close_comment:
@@ -1055,17 +1325,90 @@ async def act_analyse(update, ctx, arg):
         pair_pnl[v['symbol']] = pair_pnl.get(v['symbol'], 0) + v['pnl']
     best = max(pair_pnl.items(), key=lambda x: x[1]) if pair_pnl else ("-", 0)
     worst = min(pair_pnl.items(), key=lambda x: x[1]) if pair_pnl else ("-", 0)
+    # ---- R stats ----
+    rs = [trade_r(tr) for tr in trades]
+    rs = [r for r in rs if r is not None]
+    total_r = sum(rs)
+    win_r = sum(r for r in rs if r > 0)
+    loss_r = sum(r for r in rs if r < 0)
+    r_wins = sum(1 for r in rs if r > 0)
+    r_losses = sum(1 for r in rs if r < 0)
+    # ---- Discipline: did following all rules pay? ----
+    pnl_by_id = {k: v['pnl'] for k, v in per_trade.items()}
+    full, broke = [], []
+    for tr in trades:
+        rc = _loads(tr.rules_checked, None)
+        if rc is None:
+            continue
+        (broke if rc.get('missed') else full).append(pnl_by_id.get(tr.id, 0))
+    def _wr(lst):
+        d = [p for p in lst if p != 0]
+        return (sum(1 for p in d if p > 0) / len(d) * 100) if d else 0
+    blown_n = sum(1 for tr in trades if tr.blew == '1')
+    # ---- Best setups (confluences) ----
+    tag_stats = {}
+    for tr in trades:
+        for tg in _loads(tr.confluences, []):
+            st = tag_stats.setdefault(tg, [0, 0])
+            st[0] += 1
+            if pnl_by_id.get(tr.id, 0) > 0:
+                st[1] += 1
     s.close()
     date_str = f"{start.strftime('%d %b')} - {end.strftime('%d %b')}" if start and period != 'all' else ""
     msg = f"📊 {label} {date_str}\n\nTrades: {total_trades}\nWin Rate: {winrate:.1f}% ({wins}W/{losses}L)\nTotal PnL: ${total_pnl:+.2f}\n"
     if wins or losses:
         msg += f"Avg Win: ${avg_win:.0f} | Avg Loss: ${avg_loss:.0f}\n"
     msg += f"\nBest: {best[0]} (${best[1]:+.0f})\nWorst: {worst[0]} (${worst[1]:+.0f})\n\n🟢 WIN:{wins} 🔴 LOSS:{losses} 🟡 BE:{be}"
+    if rs:
+        msg += (f"\n\n🎯 R:R\nTotal: {total_r:+.2f}R\n"
+                f"Won: +{win_r:.2f}R ({r_wins}) | Lost: {loss_r:.2f}R ({r_losses})\n"
+                f"Avg per trade: {total_r / len(rs):+.2f}R")
+    if full or broke:
+        msg += (f"\n\n📏 Discipline\nAll rules followed: {len(full)} trades, {_wr(full):.0f}% WR, ${sum(full):+.0f}\n"
+                f"Rules broken: {len(broke)} trades, {_wr(broke):.0f}% WR, ${sum(broke):+.0f}")
+    if tag_stats:
+        top = sorted(tag_stats.items(), key=lambda x: (-x[1][0], x[0]))[:5]
+        msg += "\n\n👀 Setups\n" + "\n".join(f"{k}: {n} trades, {w / n * 100:.0f}% wins" for k, (n, w) in top)
+    if blown_n:
+        msg += f"\n\n💥 Challenges blown: {blown_n}"
     rows = [[("⬅ Back", "analyse_back", None)]]
     await update.message.reply_text(msg, reply_markup=screen(ctx, rows))
 
 async def act_analyse_back(update, ctx, arg):
     await txt_analyse(update, ctx)
+
+async def act_weekly_r(update, ctx, arg):
+    """Total R per week for the last 8 weeks."""
+    s = Session()
+    u = get_user(update.effective_user.id)
+    now = datetime.utcnow()
+    this_monday = (now - timedelta(days=now.weekday())).replace(hour=0, minute=0, second=0, microsecond=0)
+    first = this_monday - timedelta(weeks=7)
+    trades = s.query(Trade).filter(Trade.user_id == u.id, Trade.closed_at != None, Trade.closed_at >= first).all()
+    s.close()
+    weeks = {}
+    for tr in trades:
+        r = trade_r(tr)
+        if r is None:
+            continue
+        wk = (tr.closed_at - timedelta(days=tr.closed_at.weekday())).date()
+        w = weeks.setdefault(wk, [0.0, 0, 0, 0.0, 0.0])
+        w[0] += r
+        if r > 0:
+            w[1] += 1; w[3] += r
+        elif r < 0:
+            w[2] += 1; w[4] += r
+    msg = "📈 Weekly R (last 8 weeks)\n\n"
+    grand = 0.0
+    for i in range(8):
+        wk = (first + timedelta(weeks=i)).date()
+        tot, wn, ls, wr_, lr_ = weeks.get(wk, [0.0, 0, 0, 0.0, 0.0])
+        grand += tot
+        icon = "🟢" if tot > 0 else "🔴" if tot < 0 else "⚪"
+        msg += f"{icon} {wk.strftime('%d %b')}: {tot:+.2f}R  ({wn}W +{wr_:.1f}R / {ls}L {lr_:.1f}R)\n"
+    msg += f"\nTotal: {grand:+.2f}R"
+    rows = [[("⬅ Back", "analyse_back", None)]]
+    await update.message.reply_text(msg, reply_markup=screen(ctx, rows))
 
 # ---- Calendar ------------------------------------------------------------
 def _fmt_pnl_short(v):
@@ -1386,6 +1729,17 @@ DISPATCH = {
     "closeacc_done": act_closeacc_done,
     "comment_skip": act_comment_skip,
     "before_skip": act_before_skip,
+    "rule_tick": act_rule_tick,
+    "rule_tick_all": act_rule_tick_all,
+    "rules_done": act_rules_done,
+    "tag_tick": act_tag_tick,
+    "tags_done": act_tags_done,
+    "rr_set": act_rr_set,
+    "r_set": act_r_set,
+    "blow": act_blow,
+    "blow_no": act_blow_no,
+    "blow_acc": act_blow_acc,
+    "weekly_r": act_weekly_r,
     "profit_starting": act_profit_starting,
     "profit_challenge": act_profit_challenge,
     "profit_deposit": act_profit_deposit,
@@ -1622,6 +1976,32 @@ async def text_handler(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         s.close()
         await show_close_accounts_menu(update, ctx)
         return
+    elif mode == 'tags_check':
+        name = txt[:40]
+        try:
+            if not s.query(Tag).filter_by(user_id=u.id, name=name).first():
+                s.add(Tag(user_id=u.id, name=name))
+                s.commit()
+        finally:
+            s.close()
+        picked = ctx.user_data.setdefault('tags_checked', [])
+        if name not in picked:
+            picked.append(name)
+        await show_tags_check(update, ctx)
+        return
+    elif mode in ('rr_pick', 'close_r'):
+        s.close()
+        try:
+            v = float(txt.replace('1:', '', 1).replace('R', '').replace('r', '').replace('+', '').strip()) if mode == 'rr_pick' \
+                else float(txt.replace('R', '').replace('r', '').replace('+', '').strip())
+        except Exception:
+            await update.message.reply_text("Send a number like 2.5" + (" or 1:2.5" if mode == 'rr_pick' else " or -1"))
+            return
+        if mode == 'rr_pick':
+            await act_rr_set(update, ctx, v)
+        else:
+            await act_r_set(update, ctx, v)
+        return
     elif mode == 'await_before_comment':
         tid = ctx.user_data.get('before_trade_id')
         tr = s.query(Trade).get(tid)
@@ -1654,11 +2034,11 @@ async def photo_handler(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         for aid in t['acc_ids']:
             s.add(TradeAccount(trade_id=tr.id, account_id=aid))
         s.commit()
-        ctx.user_data['mode'] = 'await_before_comment'
         ctx.user_data['before_trade_id'] = tr.id
-        rows = [[("⏭ Skip", "before_skip", None)]]
-        await update.message.reply_text("✍ Add note for BEFORE photo? (optional)", reply_markup=screen(ctx, rows))
+        ctx.user_data['rules_checked'] = []
+        ctx.user_data['tags_checked'] = []
         s.close()
+        await show_rules_check(update, ctx)
         return
     elif mode == 'close' and ctx.user_data.get('close', {}).get('step') == 'photo':
         tid = ctx.user_data['close']['id']
