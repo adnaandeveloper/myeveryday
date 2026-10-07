@@ -344,8 +344,12 @@ async def txt_accounts(update, ctx):
     blown = s.query(Account).filter_by(user_id=u.id, status='BLOWN').all()
     msg = "⚙ Active Accounts\n\n"
     for a in accs:
-        cut = f" -{a.payout_cut}%" if a.type == 'CHALLENGE' else ""
-        msg += f"🟢 {a.name} ({a.type}{cut}) - ${a.current_balance:.0f}\n"
+        if a.type == 'CHALLENGE':
+            msg += f"🎯 {a.name} (CHALLENGE) - ${a.current_balance:.0f}\n"
+        elif a.type == 'FUNDED':
+            msg += f"🏆 {a.name} (FUNDED -{a.payout_cut:.0f}%) - ${a.current_balance:.0f}\n"
+        else:
+            msg += f"🟢 {a.name} ({a.type}) - ${a.current_balance:.0f}\n"
     msg += "\n📦 Archived:\n"
     for a in arch:
         msg += f"• {a.name}\n"
@@ -357,6 +361,9 @@ async def txt_accounts(update, ctx):
     for a in accs:
         row = [(f"📦 Archive {a.name}", "archive", a.id)]
         if a.type == 'CHALLENGE':
+            row.append((f"🎉 Pass {a.name}", "pass_acc", a.id))
+            row.append((f"💥 Blown {a.name}", "blow_acc", a.id))
+        elif a.type == 'FUNDED':
             row.append((f"✏ Cut {a.name}", "cut_edit", a.id))
             row.append((f"💥 Blown {a.name}", "blow_acc", a.id))
         rows.append(row)
@@ -1093,6 +1100,52 @@ async def act_cut(update, ctx, arg):
     )
 
 
+async def act_pass_acc(update, ctx, arg):
+    """Challenge passed -> ask prop cut, then becomes FUNDED."""
+    s = Session()
+    acc = s.query(Account).get(arg)
+    if not acc:
+        s.close()
+        await update.message.reply_text("Account not found.", reply_markup=main_menu(update.effective_user.id))
+        return
+    name = acc.name
+    s.close()
+    ctx.user_data['pass_acc_id'] = arg
+    ctx.user_data['mode'] = 'pass_cut'
+    rows = [
+        [("10%", "pass_cut_set", "10"), ("15%", "pass_cut_set", "15"), ("20%", "pass_cut_set", "20")],
+        [("⬅ Back to Menu", "main", None)],
+    ]
+    await update.message.reply_text(
+        f"🎉 Congrats on passing {name}!\n\nProp firm cut %? Tap a button or type it (e.g. 20 or 20%):",
+        reply_markup=screen(ctx, rows),
+    )
+
+
+async def act_pass_cut_set(update, ctx, arg):
+    aid = ctx.user_data.get('pass_acc_id')
+    if not aid:
+        await update.message.reply_text("Session expired.", reply_markup=main_menu(update.effective_user.id))
+        return
+    val = float(arg)
+    s = Session()
+    acc = s.query(Account).get(aid)
+    if not acc:
+        s.close()
+        await update.message.reply_text("Account not found.", reply_markup=main_menu(update.effective_user.id))
+        return
+    acc.type = 'FUNDED'
+    acc.payout_cut = val
+    name = acc.name
+    s.commit()
+    s.close()
+    ctx.user_data.clear()
+    await update.message.reply_text(
+        f"🏆 {name} is now FUNDED!\nProp cut {val:.0f}% (you keep {100 - val:.0f}%).",
+        reply_markup=main_menu(update.effective_user.id),
+    )
+
+
 async def act_cut_edit(update, ctx, arg):
     """Change payout_cut % on an existing CHALLENGE account."""
     s = Session()
@@ -1771,6 +1824,8 @@ DISPATCH = {
     "cut_edit": act_cut_edit,
     "cut_set": act_cut_set,
     "cut_custom": act_cut_custom,
+    "pass_acc": act_pass_acc,
+    "pass_cut_set": act_pass_cut_set,
     "archive": act_archive,
     "delacc": act_delacc,
     "pair_add": act_pair_add,
@@ -1850,7 +1905,12 @@ async def text_handler(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
                 ctx.user_data.clear()
                 await update.message.reply_text(f"✅ {acc.name} LIVE created", reply_markup=main_menu(update.effective_user.id))
         elif step == 3:
-            fee = float(txt)
+            try:
+                fee = float(txt.replace('$', '').replace(',', '').strip())
+            except ValueError:
+                await update.message.reply_text("⚠ Send the fee as a number (e.g. 500):", reply_markup=back_menu(ctx))
+                s.close()
+                return
             if fee < 0:
                 await update.message.reply_text(
                     "⚠ Fee must be a positive number (e.g. 100).\n"
@@ -1859,9 +1919,18 @@ async def text_handler(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
                 )
                 s.close()
                 return
-            ctx.user_data['na_fee'] = fee
-            rows = [[("10%", "cut", "10"), ("20%", "cut", "20")]]
-            await update.message.reply_text("Prop cut %?", reply_markup=screen(ctx, rows))
+            bal = ctx.user_data['na_bal']
+            name = ctx.user_data['na_name']
+            acc = Account(user_id=u.id, name=name, type='CHALLENGE', start_balance=bal, current_balance=bal, fee_paid=fee, payout_cut=0)
+            s.add(acc)
+            s.add(CashTx(user_id=u.id, type='FEE', amount=-fee, note=f"Buy {name}"))
+            s.commit()
+            net = s.query(func.sum(CashTx.amount)).filter_by(user_id=u.id).scalar() or 0
+            ctx.user_data.clear()
+            await update.message.reply_text(
+                f"✅ {name} CHALLENGE created\nSize: ${bal:,.0f}   |   Fee paid: -${fee:.2f}\n💰 Bank Balance: {fmt_money(net)}",
+                reply_markup=main_menu(update.effective_user.id),
+            )
     elif mode == 'withdraw':
         amt = abs(float(txt))
         acc = s.query(Account).get(ctx.user_data['wd_acc'])
@@ -1874,7 +1943,7 @@ async def text_handler(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     elif mode == 'payout':
         gross = float(txt)
         acc = s.query(Account).get(ctx.user_data['payout_acc'])
-        cut = acc.payout_cut if acc.type == 'CHALLENGE' else 0
+        cut = acc.payout_cut if acc.type == 'FUNDED' else 0
         net = gross * (1 - cut / 100)
         acc.current_balance -= gross
         s.add(CashTx(user_id=u.id, type='PAYOUT', amount=net, note=f"{acc.name}"))
@@ -1889,14 +1958,14 @@ async def text_handler(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         s.commit()
         ctx.user_data.clear()
         await update.message.reply_text(f"✅ Deposited ${amt}", reply_markup=main_menu(update.effective_user.id))
-    elif mode == 'edit_cut':
+    elif mode in ('edit_cut', 'pass_cut'):
         try:
-            val = float(txt)
+            val = float(txt.replace('%', '').replace(',', '').strip())
         except ValueError:
             await update.message.reply_text("Please send a number like 15 or 22.5", reply_markup=back_menu(ctx))
             s.close()
             return
-        aid = ctx.user_data.get('edit_cut_acc')
+        aid = ctx.user_data.get('pass_acc_id') if mode == 'pass_cut' else ctx.user_data.get('edit_cut_acc')
         acc = s.query(Account).get(aid) if aid else None
         if not acc:
             s.close()
@@ -1904,10 +1973,12 @@ async def text_handler(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             await update.message.reply_text("Session expired.", reply_markup=main_menu(update.effective_user.id))
             return
         acc.payout_cut = val
+        if mode == 'pass_cut':
+            acc.type = 'FUNDED'
         name = acc.name
         s.commit()
         ctx.user_data.clear()
-        await update.message.reply_text(f"✅ {name} prop cut set to {val:.0f}%", reply_markup=main_menu(update.effective_user.id))
+        await update.message.reply_text((f"🏆 {name} is now FUNDED! " if mode == 'pass_cut' else "✅ ") + f"{name} prop cut set to {val:.0f}%", reply_markup=main_menu(update.effective_user.id))
     elif mode == 'tx_edit_amt':
         try:
             new_amt = float(txt.replace(',', '').replace('$', '').replace('+', ''))
